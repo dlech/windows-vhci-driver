@@ -496,6 +496,52 @@ The driver is a pipe; this milestone is about what's on the other end.
 returns our radio; a `BluetoothLEAdvertisementWatcher` sees advertisements injected from
 userspace.
 
+#### 🟡 Initialisation complete; API-level exit criteria still to verify
+
+The stack initialises fully and reaches steady state. In a 20-second run there are **39
+commands and zero unanswered**, covering 29 distinct opcodes:
+
+```
+reset/identity   HCI_Reset, Read_BD_ADDR, Read_Local_Version_Information,
+                 Read_Local_Supported_Commands, Read_Local_Supported_Features,
+                 Read_Buffer_Size
+BR/EDR config    Set_Event_Mask, Write_Authentication_Enable, Write_Page_Timeout,
+                 Write_Page_Scan_Activity, Write_Inquiry_Scan_Activity,
+                 Write_Inquiry_Mode, Write_Class_of_Device, Write_Local_Name,
+                 Write_Extended_Inquiry_Response, Host_Buffer_Size,
+                 Write_Scan_Enable, Read_Inquiry_Response_Transmit_Power_Level
+LE config        Write_LE_Host_Support, LE_Set_Event_Mask,
+                 LE_Read_Local_Supported_Features, LE_Read_Buffer_Size,
+                 LE_Read_White_List_Size, LE_Read_Supported_States,
+                 LE_Read_Advertising_Channel_Tx_Power
+LE advertising   LE_Set_Random_Address, LE_Set_Advertising_Parameters,
+                 LE_Set_Advertising_Data, LE_Set_Advertise_Enable
+```
+
+Windows then builds its whole stack on top of the virtual radio:
+
+```
+Bluetooth Radio                        OK   WINVHCI\RADIO\...
+Microsoft Bluetooth Enumerator         OK   BTH\MS_BTHBRB\...
+Bluetooth Device (RFCOMM Protocol TDI) OK   BTH\MS_RFCOMM\...
+bthserv                                Running
+```
+
+The enumerator and RFCOMM nodes only appear once BthPort has a radio it considers working, so
+their presence is the real signal - not the radio node alone.
+
+Most configuration commands return status only, so they are answered by shape from a table
+rather than one at a time; only the parameter-returning commands need individual handling. Two
+values must agree with what the driver told BthPort in `QUERY_CAPABILITIES`: the ACL packet
+length in `Read_Buffer_Size` (1021) and, by extension, anything derived from it.
+
+**Still to do for the stated exit criteria:** confirm the Settings toggle, that
+`BluetoothAdapter.GetDefaultAsync()` returns this radio, and that a
+`BluetoothLEAdvertisementWatcher` sees advertisements injected from userspace. Reaching
+"initialisation completes" is necessary but not sufficient - none of those three has been
+tested yet. Note also that `vhcictl` answers plausible constants rather than modelling a
+controller; a real simulator on the other end is what M3 ultimately calls for.
+
 ### M4 — Make it survivable
 
 - Driver Verifier (standard + force IRQL checking + low resources) across a full M3 run.
