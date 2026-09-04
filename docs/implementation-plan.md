@@ -333,17 +333,27 @@ M2 - do not assume it is right merely because M1 passed.
 `KdPrint` output is only visible through the **DebugView GUI** (`Dbgview64a.exe`, elevated,
 Capture > Capture Kernel), which works reliably.
 
-`dbgviewcli64a.exe` (v5.02, ARM64) does **not** work - do not spend time on it again. It
-accepts `--accepteula -k`, prints its banner, reports itself as running, and captures nothing
-whatsoever: an empty log, not even other drivers' output. This is not the missing `Dbgv.sys`
-helper driver; it still captures nothing after a GUI session has installed `Dbgv.sys` into
-`System32\Drivers`, and it behaves identically with a real console, with `-l`, and with stdout
-redirection.
+`dbgviewcli64a.exe --kernel` **also works**, when run interactively in an elevated PowerShell
+at the guest console.
 
-The consequence is that live kernel logs require an interactive session, so anything that must
-be readable over SSH is written as a registry breadcrumb under `HKLM\SOFTWARE\winvhci`
-instead. The two are complementary: breadcrumbs answer "how far did we get" unattended, the
-GUI answers "what exactly happened" when a human is watching.
+What does *not* work is launching it from an SSH session as a detached process
+(`Start-Process`, with or without `-l`, with or without stdout redirection, with or without a
+`cmd /c` console): it prints its banner, reports itself running, and captures nothing at all -
+an empty log, not even other drivers' output. Forcing a pseudo-terminal with `ssh -tt` was
+inconclusive; ConPTY's escape sequences come through but the program's output does not.
+
+So the distinction is the interactive session, not the tool and not the `Dbgv.sys` helper
+driver (which a GUI run installs into `System32\Drivers`, and whose presence changes nothing
+for the detached case).
+
+The consequence is that live kernel logs need a human at the console, so anything that must be
+readable from an unattended SSH run is written as a registry breadcrumb under
+`HKLM\SOFTWARE\winvhci` instead. The two are complementary: breadcrumbs answer "how far did we
+get" unattended, DebugView answers "what exactly happened" when someone is watching.
+
+If unattended kernel logs become worth the effort, the known trick is to launch the CLI *into*
+the guest's interactive session from SSH via a scheduled task marked "run only when the user is
+logged on", rather than as a detached process in the SSH session.
 
 Worth revisiting: QEMU's `virt` machine *does* publish an ACPI DBG2 table, so a live kernel
 debugger over `-serial pipe:` should be possible here (it was not on VirtualBox). That would
