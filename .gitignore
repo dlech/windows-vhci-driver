@@ -1,0 +1,45 @@
+# Build output. The WDK writes into <project>\<Platform>\<Configuration>\, and
+# the ready-to-install package into a 'winvhci' folder beneath that.
+winvhci/ARM64/
+winvhci/x64/
+winvhci/ARM/
+winvhci/Win32/
+*.obj
+*.pdb
+*.iobj
+*.ipdb
+*.tlog/
+*.log
+*.lastbuildstate
+*.recipe
+*.FileListAbsolute.txt
+
+# Driver binaries and signing artifacts. The test certificate is generated per
+# machine by the WDK's test-sign step; it is not shared and must never be a
+# committed secret.
+*.sys
+*.cat
+*.cer
+*.pfx
+
+# Third-party tools, fetched rather than vendored - but keep the note that says
+# where to fetch them from.
+# (Exclude the directory's CONTENTS, not the directory itself - git will not
+# re-include a file whose parent directory is excluded.)
+build/tools/*
+!build/tools/README.md
+
+# Generated INF (stampinf expands winvhci.inx into winvhci.inf at build time).
+winvhci/winvhci.inf
+
+# Visual Studio scratch.
+.vs/
+*.user
+*.suo
+
+# VM images and staged payloads never belong in the repo.
+*.qcow2
+*.vhdx
+*.vdi
+*.iso
+*.fd

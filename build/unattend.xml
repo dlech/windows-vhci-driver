@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Offline OOBE bypass for the QEMU driver-test guest.
+
+  No QEMU display device works with this Windows-on-ARM image once Windows'
+  display stack takes over (ramfb has no PCI presence, ArmVirtQemu has no bochs
+  driver, and there is no inbox virtio-gpu driver), so the guest cannot be set
+  up interactively. This skips OOBE entirely and turns on RDP, which becomes the
+  guest's console.
+
+  __PASSWORD__ is substituted by prepare-image.ps1 from the credential file so
+  the password never lands in the repository.
+
+  Goes at <drive>:\Windows\Panther\unattend.xml before first boot.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment"
+               processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <!-- Let OOBE complete without a network / Microsoft account. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <!-- Allow incoming Remote Desktop, and open it in the firewall properly
+             rather than switching the firewall off. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>netsh advfirewall firewall set rule group="remote desktop" new enable=Yes</Path>
+        </RunSynchronousCommand>
+        <!-- Network Level Authentication off: the RDP client cannot always
+             pre-authenticate against a freshly created local account. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 0 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>vhcidev</Name>
+            <DisplayName>VHCI automation</DisplayName>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>__PASSWORD__</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <TimeZone>UTC</TimeZone>
+
+    </component>
+  </settings>
+
+</unattend>

@@ -1,0 +1,67 @@
+;
+; winvhci.inf - virtual Bluetooth HCI controller
+;
+; Root-enumerated software device. There is no hardware; the driver creates its
+; Bluetooth radio child PDO itself (M1).
+;
+; Install for test:
+;   pnputil /add-driver winvhci.inf /install
+;   devcon install winvhci.inf root\winvhci
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderString%
+DriverVer   = ; stampinf fills this in
+CatalogFile = winvhci.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13   ; driver store - required for a universal/DCH driver
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+winvhci.sys = 1,,
+
+[ControlFlags]
+ExcludeFromSelect = *
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%WinVhci.DeviceDesc% = WinVhci_Device, root\winvhci
+
+[WinVhci_Device.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+winvhci.sys
+
+[WinVhci_Device.NT.Services]
+AddService = winvhci,%SPSVCINST_ASSOCSERVICE%, WinVhci_Service_Inst
+
+[WinVhci_Service_Inst]
+DisplayName   = %WinVhci.SVCDESC%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\winvhci.sys
+
+[WinVhci_Device.NT.Wdf]
+KmdfService = winvhci, WinVhci_wdfsect
+
+[WinVhci_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ProviderString         = "windows-vhci-driver"
+ManufacturerName       = "windows-vhci-driver"
+DiskId1                = "winvhci Installation Disk"
+WinVhci.DeviceDesc     = "Virtual Bluetooth HCI Controller"
+WinVhci.SVCDESC        = "Virtual Bluetooth HCI Controller Driver"
