@@ -483,9 +483,24 @@ node appears on the control packet and disappears when the handle closes.
 
 ### M3 — A convincing controller
 
-The driver is a pipe; this milestone is about what's on the other end.
+The driver is a pipe; this milestone is about what's on the other end — and that end is
+**not this project's to write**. Good controller emulators already exist, and the goal is to
+plug one in:
 
-- Point Bumble's controller emulation at the device through the bridge.
+- [**RootCanal**](https://github.com/google/rootcanal) — Android's virtual controller. Speaks
+  H4 over TCP (HCI on 6402, test channel on 6401).
+- [**Bumble**](https://google.github.io/bumble/) — supports TCP transports directly.
+
+`tools/vhcibridge.ps1` is the connection: a byte pump between `\\.\WinVhci` and a TCP socket
+that understands nothing of HCI beyond finding packet boundaries. The one asymmetry it has to
+handle is that the device delivers exactly one packet per `ReadFile` while TCP is a stream, so
+the socket direction reassembles frames using each H4 type's length field before writing.
+
+`tools/vhcictl.ps1` answers commands with plausible constants. That is **diagnostic
+scaffolding** — it exists to see what the stack asks for and to prove the transport works, and
+must not grow into a controller model.
+
+- Point Bumble's or RootCanal's controller emulation at the device through the bridge.
 - Work through the init sequence until BthPort brings the radio up. Expect to need at least:
   Reset; Read Local Version / Supported Commands / Local Features / BD_ADDR / Buffer Size;
   Set Event Mask; and the LE command set.
@@ -539,8 +554,13 @@ length in `Read_Buffer_Size` (1021) and, by extension, anything derived from it.
 `BluetoothAdapter.GetDefaultAsync()` returns this radio, and that a
 `BluetoothLEAdvertisementWatcher` sees advertisements injected from userspace. Reaching
 "initialisation completes" is necessary but not sufficient - none of those three has been
-tested yet. Note also that `vhcictl` answers plausible constants rather than modelling a
-controller; a real simulator on the other end is what M3 ultimately calls for.
+tested yet.
+
+**And the real remaining work is the bridge, not more opcodes.** `vhcictl`'s answers are
+scaffolding. `tools/vhcibridge.ps1` is written and syntax-checked but has not yet been run
+against a live controller; doing that - RootCanal or Bumble on the VM host, reachable from the
+guest at slirp's `10.0.2.2` - is what actually closes M3. Adding further command handlers to
+`vhcictl` would be work on the wrong project.
 
 ### M4 — Make it survivable
 
