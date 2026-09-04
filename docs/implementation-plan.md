@@ -95,6 +95,40 @@ FDO context therefore holds:
 | `HostToCtrlList` | host→controller backlog when userspace isn't reading |
 | `QueueLock` (WDFSPINLOCK) | guards all six |
 
+**Measured in M1 — where the read type actually lives.** The two-queue model is right, but the
+selector is not where this section originally assumed. `IOCTL_BTHX_READ_HCI` splits one
+contiguous `BTHX_HCI_READ_WRITE_CONTEXT` across the two METHOD_NEITHER pointers:
+
+```
+Type3InputBuffer  ->  ULONG  DataLen      InputBufferLength  == 4
+Type3InputBuffer+4 == Irp->UserBuffer
+                  ->  UCHAR  Type         OutputBufferLength == 1 + capacity
+                      UCHAR  Data[capacity]
+```
+
+`Irp->UserBuffer` points **four bytes into the struct**, at `Type` — not at its start. Casting
+it to the whole struct reads `Data[3]` as `Type`, which produces a convincing but entirely
+fictional `Type == 0x00` on every read.
+
+On the way in, the ULONG in `DataLen`'s position carries the **requested packet type**, not a
+length. Observed during bring-up:
+
+| requested | capacity | channel |
+| --- | --- | --- |
+| `4` (`HciPacketEvent`) | 261 | event |
+| `2` (`HciPacketAclData`) | 1025 | ACL |
+| `2` (`HciPacketAclData`) | 1025 | ACL |
+
+The stack posts one event read and two ACL reads, and the ACL capacity is exactly
+`4 + MaxAclTransferInSize` — the value we returned from `QUERY_CAPABILITIES`. Route on the
+requested type; the capacity is a useful cross-check, and a disagreement means the assumption
+has broken.
+
+This mattered concretely: an earlier build rejected the untyped-looking reads with
+`STATUS_NOT_SUPPORTED`, which left nothing pended to receive `HCI_Reset`'s Command Complete and
+stalled the radio at `CM_PROB_FAILED_POST_START`. Parking them correctly is what moved the
+radio to `Status: OK` / `CM_PROB_NONE`.
+
 Both directions follow the sample's rendezvous rule, which is worth stating explicitly
 because it is the invariant the whole driver rests on:
 
@@ -333,27 +367,35 @@ M2 - do not assume it is right merely because M1 passed.
 `KdPrint` output is only visible through the **DebugView GUI** (`Dbgview64a.exe`, elevated,
 Capture > Capture Kernel), which works reliably.
 
-`dbgviewcli64a.exe --kernel` **also works**, when run interactively in an elevated PowerShell
-at the guest console.
+`dbgviewcli64a.exe` works fine over SSH as a detached process. Everything that looked like a
+tool limitation was **capture contention**: only one process may hold the kernel capture at a
+time, and a DebugView GUI instance (or a leaked earlier CLI instance) silently starves every
+later capture, which then produces an empty log rather than an error.
 
-What does *not* work is launching it from an SSH session as a detached process
-(`Start-Process`, with or without `-l`, with or without stdout redirection, with or without a
-`cmd /c` console): it prints its banner, reports itself running, and captures nothing at all -
-an empty log, not even other drivers' output. Forcing a pseudo-terminal with `ssh -tt` was
-inconclusive; ConPTY's escape sequences come through but the program's output does not.
+`--status` is the thing to check first - it prints `running=`, `paused=`, `elevated=`, and a
+`running=true` you did not start is the explanation for an empty log.
 
-So the distinction is the interactive session, not the tool and not the `Dbgv.sys` helper
-driver (which a GUI run installs into `System32\Drivers`, and whose presence changes nothing
-for the detached case).
+The working recipe, from the documented automation flags:
 
-The consequence is that live kernel logs need a human at the console, so anything that must be
-readable from an unattended SSH run is written as a registry breadcrumb under
-`HKLM\SOFTWARE\winvhci` instead. The two are complementary: breadcrumbs answer "how far did we
-get" unattended, DebugView answers "what exactly happened" when someone is watching.
+```powershell
+C:\tools\dbgviewcli64a.exe --stop            # release any existing capture
+Start-Process C:\tools\dbgviewcli64a.exe -ArgumentList `
+    "--accepteula","--kernel","--duration","22","--log","C:\kd.log" -WindowStyle Hidden
+```
 
-If unattended kernel logs become worth the effort, the known trick is to launch the CLI *into*
-the guest's interactive session from SSH via a scheduled task marked "run only when the user is
-logged on", rather than as a detached process in the SSH session.
+Two details that matter:
+
+- **Bound the run with `--duration`** and let it exit by itself. Killing it with `Stop-Process`
+  loses the buffered log.
+- **Do not pass `--no-win32`.** Kernel lines did not appear when Win32 capture was disabled,
+  which is not documented behaviour but is reproducible here.
+
+v5.02's CLI is explicitly designed for this kind of scripted use (`--duration`, `--max-lines`,
+`--wait-for`, `--no-banner`, `--format csv`, `--status`); read
+<https://learn.microsoft.com/sysinternals/downloads/debugview> before improvising.
+
+Registry breadcrumbs under `HKLM\SOFTWARE\winvhci` remain useful for state that must survive a
+crash or be read long after the fact, but they are no longer the only unattended channel.
 
 Worth revisiting: QEMU's `virt` machine *does* publish an ACPI DBG2 table, so a live kernel
 debugger over `-serial pipe:` should be possible here (it was not on VirtualBox). That would

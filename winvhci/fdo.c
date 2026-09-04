@@ -36,11 +36,8 @@ Environment:
 //
 // Breadcrumbs.
 //
-// KdPrint output is unreadable on this test VM: there is no live kernel
-// debugger attached, and DebugView's kernel capture does not work here (it
-// never installs its Dbgv helper driver, so it captures nothing at all).
-// Rather than fly blind, record progress as values under the device's own
-// registry key, which any SSH session can read back:
+// Durable state that outlives a capture session, recorded under a registry key
+// any SSH session can read back:
 //
 //   HKLM\SOFTWARE\winvhci
 //
@@ -51,9 +48,13 @@ Environment:
 // tracing mechanism that fails silently in the exact conditions you want to
 // trace is worse than none. This path always exists or can be created.
 //
-// This is diagnostic scaffolding for bring-up, not a permanent logging design.
-// It costs a registry write per request, which is far too expensive once the
-// data path carries real traffic - it should go once tracing works.
+// KdPrint via DebugView is the better channel for a live transcript (see
+// docs/implementation-plan.md), so these breadcrumbs are for state that must
+// survive a crash or be readable long after the fact.
+//
+// Diagnostic scaffolding for bring-up, not a permanent logging design: it costs
+// a registry write per request, far too expensive once the data path carries
+// real traffic.
 //
 VOID
 WinVhciTraceUlong(
@@ -357,21 +358,62 @@ WinVhciBthxDispatch(
 
     case IOCTL_BTHX_READ_HCI: {
 
-        PBTHX_HCI_READ_WRITE_CONTEXT r = (PBTHX_HCI_READ_WRITE_CONTEXT)outBuf;
+        //
+        // MEASURED layout - see WINVHCI_READ_TYPE_OFFSET in winvhci.h. The
+        // context is ONE contiguous struct starting at Type3InputBuffer, and
+        // UserBuffer points at its Type field, four bytes in. An earlier build
+        // cast UserBuffer to the whole struct, so it read Data[3] as Type,
+        // saw 0x00, and rejected every read the stack posted with
+        // STATUS_NOT_SUPPORTED - which is what left nothing pended to carry
+        // HCI_Reset's Command Complete and stalled the radio at
+        // CM_PROB_FAILED_POST_START.
+        //
+        PBTHX_HCI_READ_WRITE_CONTEXT r = (PBTHX_HCI_READ_WRITE_CONTEXT)inBuf;
         WDFQUEUE                     target;
+        ULONG                        capacity;
 
-        if (r == NULL || OutputBufferLength < WINVHCI_HCI_CONTEXT_HEADER_SIZE) {
-            KdPrint(("winvhci: READ_HCI bad buffer (out %p len %u)\n",
+        if (r == NULL || InputBufferLength < sizeof(ULONG) ||
+            outBuf == NULL || OutputBufferLength < sizeof(UCHAR)) {
+            KdPrint(("winvhci: READ_HCI bad buffers (in %p/%u out %p/%u)\n",
+                     inBuf, (ULONG)InputBufferLength,
                      outBuf, (ULONG)OutputBufferLength));
             status = STATUS_INVALID_PARAMETER;
             break;
         }
 
         //
-        // The caller pre-sets Type to say WHICH channel it is reading. These are
-        // two independent streams and must be parked separately.
+        // Assert the layout rather than trust it: if a future Windows passes
+        // the two buffers independently, everything below silently corrupts
+        // memory. Fail loudly instead.
         //
-        switch (r->Type) {
+        if ((PUCHAR)outBuf != (PUCHAR)inBuf + WINVHCI_READ_TYPE_OFFSET) {
+            KdPrint(("winvhci: READ_HCI UNEXPECTED LAYOUT: out %p != in %p + %u\n",
+                     outBuf, inBuf, (ULONG)WINVHCI_READ_TYPE_OFFSET));
+            WinVhciTraceUlong(device, L"WvReadLayoutBad", 1);
+            status = STATUS_INVALID_DEVICE_REQUEST;
+            break;
+        }
+
+        //
+        // MEASURED: the ULONG at Type3InputBuffer - the DataLen field's
+        // position - carries the REQUESTED PACKET TYPE on the way in, not a
+        // length. Observed values are exactly 4 (HciPacketEvent) and 2
+        // (HciPacketAclData), and they line up perfectly with the buffer sizes
+        // the stack posts:
+        //
+        //     requested 4  capacity 261    -> event
+        //     requested 2  capacity 1025   -> ACL   (= 4 + MaxAclTransferInSize)
+        //
+        // So implementation-plan.md 3.3 was right that Type selects the
+        // channel; it is simply in the input buffer rather than the output one.
+        //
+        // Route on the explicit request, and keep the capacity as a
+        // cross-check: if the two ever disagree, the assumption has broken and
+        // that is worth seeing rather than silently misrouting a stream.
+        //
+        capacity = (ULONG)OutputBufferLength - sizeof(UCHAR);
+
+        switch (r->DataLen) {
         case HciPacketEvent:
             target = ctx->ReadEventQueue;
             break;
@@ -379,15 +421,27 @@ WinVhciBthxDispatch(
             target = ctx->ReadDataQueue;
             break;
         default:
-            KdPrint(("winvhci: READ_HCI unsupported type 0x%02x\n", r->Type));
-            status = STATUS_NOT_SUPPORTED;
-            target = NULL;
+            //
+            // Unknown request: fall back to sizing, which is at least
+            // self-consistent, and complain.
+            //
+            KdPrint(("winvhci: READ_HCI unexpected requested type %u, "
+                     "falling back to capacity\n", r->DataLen));
+            WinVhciTraceUlong(device, L"WvReadOddType", r->DataLen);
+            target = (capacity >= WINVHCI_ACL_READ_CAPACITY) ? ctx->ReadDataQueue
+                                                             : ctx->ReadEventQueue;
             break;
         }
 
-        if (target == NULL) {
-            break;
+        if ((target == ctx->ReadDataQueue) != (capacity >= WINVHCI_ACL_READ_CAPACITY)) {
+            KdPrint(("winvhci: READ_HCI type/capacity DISAGREE (type %u capacity %u)\n",
+                     r->DataLen, capacity));
+            WinVhciTraceUlong(device, L"WvReadMismatch", capacity);
         }
+
+        KdPrint(("winvhci: READ_HCI request type %u capacity %u -> %s queue\n",
+                 r->DataLen, capacity,
+                 (target == ctx->ReadDataQueue) ? "acl" : "event"));
 
         status = WdfRequestForwardToIoQueue(Request, target);
         if (!NT_SUCCESS(status)) {
@@ -396,18 +450,18 @@ WinVhciBthxDispatch(
         }
 
         WdfSpinLockAcquire(ctx->Lock);
-        if (r->Type == HciPacketEvent) {
-            ctx->PendedEventReads++;
-        } else {
+        if (target == ctx->ReadDataQueue) {
             ctx->PendedDataReads++;
+        } else {
+            ctx->PendedEventReads++;
         }
         WdfSpinLockRelease(ctx->Lock);
 
         WinVhciTraceUlong(device, L"WvReadEvent", ctx->PendedEventReads);
         WinVhciTraceUlong(device, L"WvReadAcl",   ctx->PendedDataReads);
 
-        KdPrint(("winvhci: READ_HCI type 0x%02x pended (evt %u, acl %u)\n",
-                 r->Type, ctx->PendedEventReads, ctx->PendedDataReads));
+        KdPrint(("winvhci: READ_HCI pended (evt %u, acl %u)\n",
+                 ctx->PendedEventReads, ctx->PendedDataReads));
 
         //
         // Parked. Ownership has passed to the manual queue - do NOT complete.

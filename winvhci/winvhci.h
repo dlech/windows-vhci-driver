@@ -56,6 +56,30 @@ Environment:
     FIELD_OFFSET(BTHX_HCI_READ_WRITE_CONTEXT, Data)
 
 //
+// How IOCTL_BTHX_READ_HCI actually lays its buffers out. MEASURED, and not what
+// implementation-plan.md 3.3 assumed:
+//
+//   Type3InputBuffer -> ULONG DataLen        InputBufferLength  == 4
+//   Irp->UserBuffer  -> UCHAR Type           OutputBufferLength == 1 + capacity
+//                       UCHAR Data[capacity]
+//
+// It is ONE contiguous BTHX_HCI_READ_WRITE_CONTEXT beginning at
+// Type3InputBuffer, with UserBuffer pointing at its Type field - four bytes
+// into the struct, not at the start. Casting UserBuffer to the whole struct
+// reads Data[3] as Type, which is where the phantom "Type == 0x00" came from.
+//
+#define WINVHCI_READ_TYPE_OFFSET FIELD_OFFSET(BTHX_HCI_READ_WRITE_CONTEXT, Type)
+
+//
+// Read capacity tells the channels apart, since Type is not set on the way in.
+// The stack posts one small buffer for events and larger ones for ACL data,
+// and the ACL capacity is exactly the transfer size we reported in
+// QUERY_CAPABILITIES plus the 4-byte ACL header.
+//
+#define WINVHCI_ACL_HEADER_SIZE   4
+#define WINVHCI_ACL_READ_CAPACITY (WINVHCI_ACL_HEADER_SIZE + WINVHCI_MAX_ACL_TRANSFER_IN)
+
+//
 // FDO context. For M1 this holds only what is needed to accept and park the
 // stack's requests; the userspace-facing queues and backlog lists described in
 // implementation-plan.md 3.3 arrive with M2.
