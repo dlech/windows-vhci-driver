@@ -190,6 +190,67 @@ pointers from the IRP stack location.)
 outright while the stack is driving the transport, one round that kills it with ACL traffic in
 flight mid-GATT, and a device restart under a live client.
 
+**Low resources simulation does not reach this driver.** With randomized fault injection at
+probability 10000 — 100% — and no delay, Verifier deliberately failed *none* of the driver's
+allocations:
+
+```
+Pool Allocations Attempted:              24
+Pool Allocations Failed Deliberately:     0
+```
+
+It still tracks them, it just will not fail them, and the likely reason is that both allocation
+sites call `ExAllocatePool2` while holding the FDO spinlock, at DISPATCH_LEVEL. So the
+out-of-memory paths cannot be exercised this way. `WvFailAllocOneIn` under
+`HKLM\SOFTWARE\winvhci` fails every Nth packet allocation instead, and is the only way those
+paths run at all. Zero, the default, disables it.
+
+### Reading a bugcheck in this guest
+
+**A bugcheck is invisible from the host.** `qemu-screenshot.ps1` returns black once Windows has
+taken over the display, so a bugcheck screen looks exactly like a hung VM, and recovering the
+VM before reading the dump destroys the evidence. Three things make it legible:
+
+- Set `AutoReboot = 1` in `HKLM\SYSTEM\CurrentControlSet\Control\CrashControl`. The guest then
+  restarts by itself and records the stop code where it can be read back:
+
+  ```powershell
+  Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001} -MaxEvents 5
+  # The bugcheck was: 0x000000c4 (0x0000000000000062, ...)
+  ```
+
+- With `AutoReboot = 1`, a machine that sits there spinning instead of restarting is probably
+  *not* bugchecked. That distinction is what separated a real driver defect from the QEMU reset
+  hang below.
+
+- Ask the monitor where the guest actually is. Sampling twice and comparing is the useful part:
+  an unchanging PC on several CPUs is a spin, not slow progress.
+
+  ```powershell
+  # via QMP human-monitor-command
+  info registers -a     # PC per vCPU
+  info cpus
+  ```
+
+### QEMU hangs on a guest-initiated reboot
+
+A guest **restart** hangs this VM: the guest finishes shutting down, parks its application
+processors, asks for a reset that never takes effect, and the remaining CPUs spin forever at
+~350% CPU with no SSH. The monitor shows it plainly — two CPUs pinned at the same kernel PC
+across samples, the other two already at `PC=0`.
+
+A guest **shutdown** is fine and exits QEMU cleanly, which fits the two being different PSCI
+calls on ARM64: `SYSTEM_OFF` works, `SYSTEM_RESET` does not. This is a known class of QEMU
+problem rather than anything specific to this project — Windows guests hanging on reboot with
+every vCPU pegged are reported at
+[#1490853](https://bugs.launchpad.net/qemu/+bug/1490853) and
+[#2064914](https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/2064914), with an aarch64
+high-CPU case at [#1826401](https://bugs.launchpad.net/qemu/+bug/1826401).
+
+`qemu-run.ps1` passes **`-no-reboot`**, which turns the reset into a clean QEMU exit so the
+wrapper can just relaunch. Without it the symptom is indistinguishable from a driver hang, and
+telling the two apart costs real time.
+
 **Allow ~10 seconds for a radio to disappear.** The driver's own teardown is immediate —
 `EvtFileClose` and `all radios removed` are microseconds apart — but `Get-PnpDevice` keeps
 reporting the radio for a consistent ~8.4 s afterwards while Windows removes the device stack

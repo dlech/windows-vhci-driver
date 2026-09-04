@@ -148,16 +148,30 @@ simulated link, and raw-byte Command Complete replies. All are in
   and the output from the raw IRP. Under Verifier the captured `Type3InputBuffer` is NULL, so
   `SET_VERSION` failed and the radio never started. Both now come from the IRP's current stack
   location. See [design.md](design.md).
-- **A full GATT session passes under Verifier**, with 322 pool allocations, none failed and
-  **none leaked** across the whole suite.
+- **A pool leak, caught as a bugcheck.** Verifier's second finding was
+  `0xC4 (DRIVER_VERIFIER_DETECTED_VIOLATION), 0x62` — "driver has forgotten to free its pool
+  allocations prior to unloading", with exactly one allocation outstanding. When a client died,
+  `EvtFileClose` purged the backlogs, but the Bluetooth stack kept issuing `WRITE_HCI` for the
+  several seconds PnP takes to tear the radio down, and each one queued a packet onto a list no
+  reader would ever drain. `WinVhciQueueToUser` now drops when there is no owner, and
+  `EvtSelfManagedIoCleanup` purges the backlogs as a safety net.
+
+  It only ever fired on device removal or shutdown, never in normal operation, which made it
+  look like the VM hanging rather than a driver defect — see the note on reading a bugcheck in
+  [development.md](development.md).
+- **A full GATT session passes under Verifier**, and 153 allocations across the final suite with
+  **none outstanding**.
 - **Teardown races** (`tools/abuse-teardown.ps1`): repeated abrupt client kills during
-  initialisation, a kill with ACL traffic in flight mid-GATT, and a device restart under a live
-  client. No bugcheck, no stale radios, no leaked pool.
+  initialisation, a kill with ACL traffic in flight mid-GATT, a device restart under a live
+  client, and repeated unload/reload cycles. No bugcheck, no stale radios, no leaked pool.
 
 **Still to do:**
 
-- Randomized and systematic **low-resources simulation** — Verifier's fault injection. Not yet
-  run; the driver's allocation failure paths are therefore untested.
+- **Low-resources simulation does not reach this driver.** At 100% injection probability
+  Verifier deliberately failed none of its allocations, most likely because both sites allocate
+  while holding the FDO spinlock. The `WvFailAllocOneIn` registry knob exercises those paths
+  instead, but Verifier's own fault injection remains unavailable here, and **systematic** low
+  resources simulation has not been tried.
 - **Static Driver Verifier**, which is separate from Code Analysis and has not been run.
 - **Sleep/resume and Airplane mode.** The serialhcibus sample carries
   `GUID_DEVINTERFACE_BLUETOOTH_RADIO_ONOFF_VENDOR_SPECIFIC` handling for the toggle — add it

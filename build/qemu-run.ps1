@@ -114,6 +114,25 @@ $qemuArgs = @(
     '-netdev', "user,id=n0,hostfwd=tcp:127.0.0.1:$RdpPort-:3389,hostfwd=tcp:127.0.0.1:$SshPort-:22"
     '-device', 'virtio-net-pci,netdev=n0'
 
+    # Exit instead of resetting when the guest reboots.
+    #
+    # A guest-initiated RESTART hangs this machine: the guest completes its
+    # shutdown, parks its application processors, asks for a reset that never
+    # takes effect, and the remaining CPUs spin forever. Sampling the vCPUs from
+    # the monitor shows it plainly - two CPUs pinned at the same kernel PC
+    # across samples, the other two at PC=0:
+    #
+    #   CPU#0  PC=fffff803a1d66a00      CPU#1  PC=0000000000000000
+    #   CPU#2  PC=fffff803a1d66a00      CPU#3  PC=0000000000000000
+    #
+    # A guest-initiated SHUTDOWN is fine and exits QEMU cleanly, which fits the
+    # two being different PSCI calls on ARM64 - SYSTEM_OFF works, SYSTEM_RESET
+    # does not. With -no-reboot a reset becomes an exit, so the wrapper can just
+    # relaunch. Without it the VM has to be recovered by hand, and the symptom -
+    # QEMU pegged at ~350% CPU with no SSH - looks exactly like a driver hang,
+    # which cost real time to tell apart from one.
+    '-no-reboot'
+
     '-rtc', 'base=localtime'
     '-name', 'winvhci-test'
 

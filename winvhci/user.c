@@ -122,6 +122,30 @@ Routine Description:
     WdfSpinLockAcquire(Ctx->Lock);
 
     //
+    // With no client there is nobody to ever read this, so drop it rather than
+    // queue it.
+    //
+    // This is not merely tidy. When a client dies, EvtFileClose purges the
+    // backlogs - but the Bluetooth stack goes on issuing WRITE_HCI for the
+    // several seconds it takes PnP to tear the radio down, and every one of
+    // those used to allocate a packet onto a list no reader would ever drain.
+    // Those allocations survived until the driver unloaded, where Driver
+    // Verifier caught them:
+    //
+    //   BugCheck 0xC4 (DRIVER_VERIFIER_DETECTED_VIOLATION), 0x62
+    //   "driver has forgotten to free its pool allocations prior to unloading"
+    //
+    // It only ever fired on device removal or shutdown, never in normal
+    // operation, which is what made it look like the VM hanging rather than a
+    // driver defect.
+    //
+    if (Ctx->Owner == NULL) {
+        Ctx->DropCount++;
+        WdfSpinLockRelease(Ctx->Lock);
+        return;
+    }
+
+    //
     // Rendezvous: a waiting reader takes the packet directly; otherwise it goes
     // on the backlog. Retrieving the request under the lock keeps the two
     // decisions atomic with respect to each other.
@@ -144,7 +168,9 @@ Routine Description:
             return;
         }
 
-        p = WinVhciAllocPacket(Type, Body, Length);
+        p = WinVhciTestFailAlloc(Ctx)
+                ? NULL
+                : WinVhciAllocPacket(Type, Body, Length);
         if (p == NULL) {
             Ctx->DropCount++;
             WdfSpinLockRelease(Ctx->Lock);

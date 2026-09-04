@@ -305,10 +305,12 @@ Routine Description:
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        p = (PWINVHCI_PACKET)ExAllocatePool2(
-                POOL_FLAG_NON_PAGED,
-                FIELD_OFFSET(WINVHCI_PACKET, Data) + Length,
-                WINVHCI_POOL_TAG);
+        p = WinVhciTestFailAlloc(Ctx)
+                ? NULL
+                : (PWINVHCI_PACKET)ExAllocatePool2(
+                      POOL_FLAG_NON_PAGED,
+                      FIELD_OFFSET(WINVHCI_PACKET, Data) + Length,
+                      WINVHCI_POOL_TAG);
         if (p == NULL) {
             Ctx->DropCount++;
             WdfSpinLockRelease(Ctx->Lock);
@@ -757,6 +759,26 @@ Routine Description:
     WDF_IO_QUEUE_CONFIG  config;
     NTSTATUS             status;
 
+    //
+    // Read the allocation-failure knob once, here, because this runs at
+    // PASSIVE_LEVEL and the two allocation sites do not.
+    //
+    // Driver Verifier's low resources simulation never fires against those
+    // sites: at 100% probability it deliberately failed none of them, because
+    // both allocate while holding the FDO spinlock. So Verifier cannot execute
+    // the driver's out-of-memory paths, and without something like this they
+    // would never run at all. Zero, the default, disables it entirely.
+    //
+    //   HKLM\SOFTWARE\winvhci
+    //     WvFailAllocOneIn  REG_DWORD  fail every Nth packet allocation
+    //
+    ctx->FailAllocOneIn = 0;
+    (VOID)WinVhciReadUlong(Device, L"WvFailAllocOneIn", &ctx->FailAllocOneIn);
+    if (ctx->FailAllocOneIn != 0) {
+        KdPrint(("winvhci: TEST fault injection active: failing 1 in %u allocations\n",
+                 ctx->FailAllocOneIn));
+    }
+
     WDF_IO_QUEUE_CONFIG_INIT(&config, WdfIoQueueDispatchParallel);
     config.PowerManaged                    = WdfFalse;
     config.EvtIoInternalDeviceControl      = WinVhciEvtBthxInternalDeviceControl;
@@ -816,4 +838,13 @@ Routine Description:
     if (ctx->ReadDataQueue != NULL) {
         WdfIoQueuePurgeSynchronously(ctx->ReadDataQueue);
     }
+
+    //
+    // Free anything still sitting on the three backlogs. EvtFileClose already
+    // does this when a client closes, but the driver must not depend on a
+    // client having existed, or having closed tidily, before the device goes
+    // away. A single packet left here is a pool allocation outstanding at
+    // unload, which Driver Verifier bugchecks as 0xC4 / 0x62.
+    //
+    WinVhciPurgeBacklogs(ctx);
 }

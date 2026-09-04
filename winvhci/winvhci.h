@@ -171,6 +171,18 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     ULONG       BthxVersion;        // as agreed via SET_VERSION
 
     //
+    // Test-only allocation fault injection, set from HKLM\SOFTWARE\winvhci
+    // (WvFailAllocOneIn) at device add. Zero disables it.
+    //
+    // This exists because Driver Verifier's low resources simulation cannot
+    // reach the driver's two allocation sites - both allocate while holding
+    // Lock, and at 100% injection probability Verifier failed none of them.
+    // Both counters below are guarded by Lock, like everything else here.
+    //
+    ULONG       FailAllocOneIn;
+    ULONG       AllocSeq;
+
+    //
     // Counters. M1's exit criterion is observational, so make the observations
     // cheap to read back.
     //
@@ -183,6 +195,23 @@ typedef struct _WINVHCI_FDO_CONTEXT {
 } WINVHCI_FDO_CONTEXT, *PWINVHCI_FDO_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WINVHCI_FDO_CONTEXT, WinVhciFdoGetContext)
+
+//
+// TRUE when the test knob says this allocation should be failed. The caller
+// must hold Lock, which every allocation site already does.
+//
+FORCEINLINE
+BOOLEAN
+WinVhciTestFailAlloc(
+    _Inout_ PWINVHCI_FDO_CONTEXT Ctx
+    )
+{
+    if (Ctx->FailAllocOneIn == 0) {
+        return FALSE;
+    }
+    Ctx->AllocSeq++;
+    return (BOOLEAN)((Ctx->AllocSeq % Ctx->FailAllocOneIn) == 0);
+}
 
 //
 // How the FDO's child list identifies a radio. Must begin with the framework's
