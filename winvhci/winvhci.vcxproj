@@ -64,6 +64,7 @@
     <ClCompile Include="driver.c" />
     <ClCompile Include="fdo.c" />
     <ClCompile Include="pdo.c" />
+    <ClCompile Include="user.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="winvhci.h" />

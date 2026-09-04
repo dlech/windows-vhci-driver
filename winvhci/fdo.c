@@ -182,118 +182,151 @@ WinVhciLogHciPacket(
 }
 
 static NTSTATUS
-WinVhciDeliverEvent(
-    _In_ PWINVHCI_FDO_CONTEXT       Ctx,
-    _In_reads_bytes_(Length) const UCHAR *Payload,
-    _In_ ULONG                      Length
+WinVhciCompleteRead(
+    _In_ WDFREQUEST Request,
+    _In_ UCHAR      Type,
+    _In_reads_bytes_(Length) const UCHAR *Body,
+    _In_ ULONG      Length
     )
 /*++
 
 Routine Description:
 
-    Completes one pended IOCTL_BTHX_READ_HCI from the event queue with an HCI
-    event, i.e. the controller-to-host direction of the rendezvous rule in
-    implementation-plan.md 3.3.
+    Completes one pended IOCTL_BTHX_READ_HCI with a controller-to-host packet.
 
-    Payload is the HCI event WITHOUT its H4 type byte - the type travels in the
-    context's Type field instead.
-
-Return Value:
-
-    STATUS_NO_MORE_ENTRIES if no read is pended, in which case the caller should
-    treat the event as dropped (M2 gives it a backlog list to sit in instead).
+    Body is the HCI packet WITHOUT its H4 type byte; the type travels in the
+    context's Type field. See winvhci.h for the buffer layout, which is not the
+    obvious one.
 
 --*/
 {
-    WDFREQUEST                   request;
     WDF_REQUEST_PARAMETERS       params;
     PIRP                         irp;
     PBTHX_HCI_READ_WRITE_CONTEXT out;
     ULONG                        capacity;
-    NTSTATUS                     status;
-
-    status = WdfIoQueueRetrieveNextRequest(Ctx->ReadEventQueue, &request);
-    if (!NT_SUCCESS(status)) {
-        KdPrint(("winvhci: no event read pended, dropping %u byte event\n", Length));
-        return STATUS_NO_MORE_ENTRIES;
-    }
 
     WDF_REQUEST_PARAMETERS_INIT(&params);
-    WdfRequestGetParameters(request, &params);
+    WdfRequestGetParameters(Request, &params);
 
-    irp = WdfRequestWdmGetIrp(request);
+    irp = WdfRequestWdmGetIrp(Request);
     out = (PBTHX_HCI_READ_WRITE_CONTEXT)irp->UserBuffer;
 
     if (out == NULL ||
         params.Parameters.DeviceIoControl.OutputBufferLength <
             WINVHCI_HCI_CONTEXT_HEADER_SIZE) {
-        WdfRequestComplete(request, STATUS_INVALID_PARAMETER);
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
     }
 
     capacity = (ULONG)params.Parameters.DeviceIoControl.OutputBufferLength -
                WINVHCI_HCI_CONTEXT_HEADER_SIZE;
     if (capacity < Length) {
-        KdPrint(("winvhci: event too big for read buffer (%u > %u)\n", Length, capacity));
-        WdfRequestComplete(request, STATUS_BUFFER_TOO_SMALL);
+        KdPrint(("winvhci: packet too big for read buffer (%u > %u)\n", Length, capacity));
+        WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL);
         return STATUS_BUFFER_TOO_SMALL;
     }
 
-    //
-    // UserBuffer is the whole context: DataLen, then Type, then Data.
-    //
-    out->Type    = (UCHAR)HciPacketEvent;
+    out->Type    = Type;
     out->DataLen = Length;
-    RtlCopyMemory(out->Data, Payload, Length);
+    if (Length != 0) {
+        RtlCopyMemory(out->Data, Body, Length);
+    }
 
-    KdPrint(("winvhci: delivered event, %u bytes (capacity %u)\n", Length, capacity));
-
-    WdfRequestCompleteWithInformation(request,
+    WdfRequestCompleteWithInformation(Request,
                                       STATUS_SUCCESS,
                                       WINVHCI_HCI_CONTEXT_HEADER_SIZE + Length);
 
     return STATUS_SUCCESS;
 }
 
-static VOID
-WinVhciAnswerCommand(
+NTSTATUS
+WinVhciDeliverToStack(
     _In_ PWINVHCI_FDO_CONTEXT Ctx,
-    _In_ USHORT               Opcode
+    _In_ UCHAR                Type,
+    _In_reads_bytes_(Length) const UCHAR *Body,
+    _In_ ULONG                Length
     )
 /*++
 
 Routine Description:
 
-    STOPGAP. Answers a host command with a Command Complete carrying status
-    "success" and no return parameters.
+    The controller-to-host half of the rendezvous: hand the packet to a pended
+    BTHX read if there is one, otherwise queue it on the matching backlog.
 
-    This exists only to get the stack past HCI_Reset so its full initialisation
-    sequence can be observed - that transcript is the specification for M3. It
-    is not a controller model: commands that must return parameters (Read
-    Local Version, Read BD_ADDR, Read Buffer Size ...) will be answered with a
-    reply that is well-formed but empty, which the stack is entitled to reject.
-
-    M2 replaces this entirely by handing commands to userspace and letting the
-    simulator decide the reply.
+    Called from the userspace write path, so this is where a simulator's events
+    and ACL data enter the Windows Bluetooth stack.
 
 --*/
 {
-    UCHAR event[6];
+    WDFQUEUE    queue;
+    PLIST_ENTRY head;
+    PULONG      count;
+    WDFREQUEST  request = NULL;
+    NTSTATUS    status;
+
+    if (Type == WINVHCI_H4_ACL) {
+        queue = Ctx->ReadDataQueue;
+        head  = &Ctx->PendingDataList;
+        count = &Ctx->PendingDataCount;
+    } else {
+        queue = Ctx->ReadEventQueue;
+        head  = &Ctx->PendingEventList;
+        count = &Ctx->PendingEventCount;
+    }
+
+    WdfSpinLockAcquire(Ctx->Lock);
 
     //
-    // Command Complete (7.7.14): event code, parameter length, then
-    // Num_HCI_Command_Packets, the opcode being completed, and the status.
+    // Only take a pended read if nothing is already queued ahead of this
+    // packet, or packets would be delivered out of order.
     //
-    event[0] = 0x0E;                      // HCI_Command_Complete
-    event[1] = 0x04;                      // parameter total length
-    event[2] = 0x01;                      // controller can accept 1 more command
-    event[3] = (UCHAR)(Opcode & 0xFF);    // opcode, little endian
-    event[4] = (UCHAR)(Opcode >> 8);
-    event[5] = 0x00;                      // status = success
+    if (*count == 0) {
+        status = WdfIoQueueRetrieveNextRequest(queue, &request);
+        if (!NT_SUCCESS(status)) {
+            request = NULL;
+        }
+    }
 
-    KdPrint(("winvhci: answering opcode 0x%04x with Command Complete\n", Opcode));
+    if (request == NULL) {
+        PWINVHCI_PACKET p;
 
-    (VOID)WinVhciDeliverEvent(Ctx, event, sizeof(event));
+        if (*count >= WINVHCI_MAX_BACKLOG) {
+            Ctx->DropCount++;
+            WdfSpinLockRelease(Ctx->Lock);
+            KdPrint(("winvhci: stack backlog full, dropped type 0x%02x\n", Type));
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        p = (PWINVHCI_PACKET)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED,
+                FIELD_OFFSET(WINVHCI_PACKET, Data) + Length,
+                WINVHCI_POOL_TAG);
+        if (p == NULL) {
+            Ctx->DropCount++;
+            WdfSpinLockRelease(Ctx->Lock);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        p->Type   = Type;
+        p->Length = Length;
+        if (Length != 0) {
+            RtlCopyMemory(p->Data, Body, Length);
+        }
+
+        InsertTailList(head, &p->Link);
+        (*count)++;
+        WdfSpinLockRelease(Ctx->Lock);
+
+        KdPrint(("winvhci: no read pended for type 0x%02x, queued (%u waiting)\n",
+                 Type, *count));
+        return STATUS_SUCCESS;
+    }
+
+    WdfSpinLockRelease(Ctx->Lock);
+
+    KdPrint(("winvhci: delivering type 0x%02x, %u bytes to the stack\n", Type, Length));
+
+    return WinVhciCompleteRead(request, Type, Body, Length);
 }
 
 static VOID
@@ -464,28 +497,15 @@ WinVhciBthxDispatch(
         WinVhciLogHciPacket(w->Type, w->Data, w->DataLen);
 
         //
-        // Complete the write BEFORE answering it. The event is delivered by
-        // completing a different, already-pended request, so the order is not
-        // forced - but answering first would mean the stack could see the
-        // Command Complete for a command whose own write had not yet completed.
+        // Hand it to userspace. The driver has no opinion about HCI semantics:
+        // the simulator on the other side of \\.\WinVhci decides what, if
+        // anything, to reply. (M1 answered commands here with a canned empty
+        // Command Complete, purely to see the stack advance; that is gone.)
         //
+        WinVhciQueueToUser(ctx, w->Type, w->Data, w->DataLen);
+
         info   = w->DataLen;
         status = STATUS_SUCCESS;
-
-        //
-        // STOPGAP, to be replaced by the userspace data path in M2: answer
-        // commands here in the driver so the stack advances past HCI_Reset and
-        // reveals the rest of its initialisation sequence, which is the
-        // transcript M3 is specified from.
-        //
-        if (w->Type == HciPacketCommand && w->DataLen >= 3) {
-            USHORT opcode = (USHORT)(w->Data[0] | (w->Data[1] << 8));
-
-            WdfRequestCompleteWithInformation(Request, status, info);
-            WinVhciAnswerCommand(ctx, opcode);
-            return;
-        }
-
         break;
     }
 
@@ -575,6 +595,25 @@ WinVhciBthxDispatch(
         KdPrint(("winvhci: READ_HCI request type %u capacity %u -> %s queue\n",
                  r->DataLen, capacity,
                  (target == ctx->ReadDataQueue) ? "acl" : "event"));
+
+        //
+        // The other half of the rendezvous: if userspace already produced a
+        // packet of this type, this read completes immediately rather than
+        // parking behind a packet that is sitting right there.
+        //
+        {
+            UCHAR           wantType = (target == ctx->ReadDataQueue) ? WINVHCI_H4_ACL
+                                                                     : WINVHCI_H4_EVENT;
+            PWINVHCI_PACKET queued   = WinVhciTakePendingForStack(ctx, wantType);
+
+            if (queued != NULL) {
+                KdPrint(("winvhci: READ_HCI satisfied from backlog, type 0x%02x %u bytes\n",
+                         queued->Type, queued->Length));
+                status = WinVhciCompleteRead(Request, queued->Type, queued->Data, queued->Length);
+                ExFreePoolWithTag(queued, WINVHCI_POOL_TAG);
+                return;
+            }
+        }
 
         status = WdfRequestForwardToIoQueue(Request, target);
         if (!NT_SUCCESS(status)) {

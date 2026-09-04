@@ -27,6 +27,7 @@ Environment:
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text (PAGE, WinVhciEvtChildListCreateDevice)
 #pragma alloc_text (PAGE, WinVhciAddRadio)
+#pragma alloc_text (PAGE, WinVhciRemoveRadios)
 #endif
 
 static NTSTATUS
@@ -288,4 +289,35 @@ Routine Description:
     KdPrint(("winvhci: AddRadio %u -> 0x%08x\n", RadioId, status));
 
     return status;
+}
+
+NTSTATUS
+WinVhciRemoveRadios(
+    _In_ WDFDEVICE Fdo
+    )
+/*++
+
+Routine Description:
+
+    Reports every radio as gone, which makes the Bluetooth stack tear down and
+    the node vanish from Device Manager.
+
+    Marking all children missing in one pass, rather than removing a remembered
+    handle, keeps this correct if a client ever creates more than one radio, and
+    is idempotent when there are none.
+
+--*/
+{
+    WDFCHILDLIST list = WdfFdoGetDefaultChildList(Fdo);
+
+    WdfChildListBeginScan(list);
+    //
+    // A scan that reports nothing present marks everything previously reported
+    // as missing when it ends.
+    //
+    WdfChildListEndScan(list);
+
+    KdPrint(("winvhci: all radios removed\n"));
+
+    return STATUS_SUCCESS;
 }

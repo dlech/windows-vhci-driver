@@ -87,9 +87,44 @@ Environment:
 #define WINVHCI_MAX_EVENT_SIZE 257
 
 //
-// FDO context. For M1 this holds only what is needed to accept and park the
-// stack's requests; the userspace-facing queues and backlog lists described in
-// implementation-plan.md 3.3 arrive with M2.
+// H4 packet type bytes, as used on the userspace wire. These are the same
+// values as BTHX_HCI_PACKET_TYPE for the three types the DDI supports, which is
+// why no translation table is needed (implementation-plan.md 3.5).
+//
+#define WINVHCI_H4_COMMAND 0x01
+#define WINVHCI_H4_ACL     0x02
+#define WINVHCI_H4_SCO     0x03
+#define WINVHCI_H4_EVENT   0x04
+#define WINVHCI_H4_ISO     0x05
+#define WINVHCI_H4_VENDOR  0xFF
+
+//
+// Largest userspace transfer: one H4 type byte plus the biggest packet body,
+// which is an ACL header plus MaxAclTransferInSize.
+//
+#define WINVHCI_MAX_BODY      (4 + WINVHCI_MAX_ACL_TRANSFER_IN)
+#define WINVHCI_MAX_H4_PACKET (1 + WINVHCI_MAX_BODY)
+
+//
+// Backlog bound. A virtual controller that blocks the host stack is worse than
+// one that loses a packet, so overflow drops and counts rather than waits.
+//
+#define WINVHCI_MAX_BACKLOG 64
+
+#define WINVHCI_POOL_TAG 'ihvW'
+
+//
+// One queued HCI packet, body only - the type travels alongside it.
+//
+typedef struct _WINVHCI_PACKET {
+    LIST_ENTRY Link;
+    UCHAR      Type;
+    ULONG      Length;
+    _Field_size_bytes_(Length) UCHAR Data[ANYSIZE_ARRAY];
+} WINVHCI_PACKET, *PWINVHCI_PACKET;
+
+//
+// FDO context.
 //
 typedef struct _WINVHCI_FDO_CONTEXT {
 
@@ -109,7 +144,29 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     WDFQUEUE    ReadEventQueue;     // Type == HciPacketEvent
     WDFQUEUE    ReadDataQueue;      // Type == HciPacketAclData
 
-    WDFSPINLOCK Lock;               // guards the counters below
+    //
+    // The userspace side of the seam: \\.\WinVhci, opened exclusively by one
+    // simulator at a time (implementation-plan.md 3.4).
+    //
+    WDFQUEUE      UserReadQueue;    // manual: pended ReadFile
+    WDFFILEOBJECT Owner;            // the one open handle, or NULL
+
+    //
+    // Backlogs, for whichever side of a rendezvous arrives first.
+    //
+    LIST_ENTRY  HostToCtrlList;     // stack -> userspace
+    LIST_ENTRY  PendingEventList;   // userspace -> stack, events
+    LIST_ENTRY  PendingDataList;    // userspace -> stack, ACL
+
+    ULONG       HostToCtrlCount;
+    ULONG       PendingEventCount;
+    ULONG       PendingDataCount;
+    ULONG       DropCount;
+
+    BOOLEAN     RadioPresent;
+    ULONG       NextRadioId;
+
+    WDFSPINLOCK Lock;               // guards every field above and below
 
     ULONG       BthxVersion;        // as agreed via SET_VERSION
 
@@ -177,6 +234,60 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL          WinVhciEvtBthxDeviceControl;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_CLEANUP      WinVhciEvtSelfManagedIoCleanup;
 
 //
+// Hands a controller-to-host packet to whichever BTHX read is pended, or parks
+// it on the matching backlog list. Called from the userspace write path.
+//
+NTSTATUS
+WinVhciDeliverToStack(
+    _In_ PWINVHCI_FDO_CONTEXT Ctx,
+    _In_ UCHAR                Type,
+    _In_reads_bytes_(Length) const UCHAR *Body,
+    _In_ ULONG                Length
+    );
+
+//
+// Takes a queued controller-to-host packet of the given type, if one is
+// waiting. Called from the BTHX read path so a read that arrives after its
+// packet still completes immediately. Caller owns the returned packet.
+//
+PWINVHCI_PACKET
+WinVhciTakePendingForStack(
+    _In_ PWINVHCI_FDO_CONTEXT Ctx,
+    _In_ UCHAR                Type
+    );
+
+//
+// user.c - the \\.\WinVhci interface
+//
+NTSTATUS
+WinVhciUserInitDevice(
+    _In_ PWDFDEVICE_INIT DeviceInit
+    );
+
+NTSTATUS
+WinVhciUserCreateQueues(
+    _In_ WDFDEVICE Device
+    );
+
+VOID
+WinVhciQueueToUser(
+    _In_ PWINVHCI_FDO_CONTEXT Ctx,
+    _In_ UCHAR                Type,
+    _In_reads_bytes_(Length) const UCHAR *Body,
+    _In_ ULONG                Length
+    );
+
+VOID
+WinVhciPurgeBacklogs(
+    _In_ PWINVHCI_FDO_CONTEXT Ctx
+    );
+
+EVT_WDF_DEVICE_FILE_CREATE WinVhciEvtDeviceFileCreate;
+EVT_WDF_FILE_CLOSE         WinVhciEvtFileClose;
+EVT_WDF_IO_QUEUE_IO_READ   WinVhciEvtIoRead;
+EVT_WDF_IO_QUEUE_IO_WRITE  WinVhciEvtIoWrite;
+
+//
 // pdo.c
 //
 EVT_WDF_CHILD_LIST_CREATE_DEVICE WinVhciEvtChildListCreateDevice;
@@ -185,4 +296,9 @@ NTSTATUS
 WinVhciAddRadio(
     _In_ WDFDEVICE Fdo,
     _In_ ULONG     RadioId
+    );
+
+NTSTATUS
+WinVhciRemoveRadios(
+    _In_ WDFDEVICE Fdo
     );

@@ -107,6 +107,15 @@ Routine Description:
     pnpCallbacks.EvtDeviceSelfManagedIoCleanup = WinVhciEvtSelfManagedIoCleanup;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpCallbacks);
 
+    //
+    // Userspace-facing configuration - I/O type, exclusivity and the file
+    // object callbacks - must also be set on the DEVICE_INIT.
+    //
+    status = WinVhciUserInitDevice(DeviceInit);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, WINVHCI_FDO_CONTEXT);
 
     status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
@@ -139,17 +148,21 @@ Routine Description:
         return status;
     }
 
-    //
-    // M1: one radio, always present. Failing to add it is not fatal to the FDO
-    // itself - the device still loads, and the missing child is the symptom
-    // worth seeing in Device Manager rather than a load failure that hides it.
-    //
-    status = WinVhciAddRadio(device, 1);
+    status = WinVhciUserCreateQueues(device);
     if (!NT_SUCCESS(status)) {
-        KdPrint(("winvhci: WinVhciAddRadio failed 0x%08x\n", status));
+        return status;
     }
 
-    KdPrint(("winvhci: FDO %p ready\n", device));
+    //
+    // No radio is created here. From M2 on, the controller's lifetime is the
+    // userspace handle's lifetime: it appears when a client writes the
+    // FF <opcode> control packet and disappears when the handle closes, exactly
+    // as opening and closing /dev/vhci works on Linux.
+    //
+    // M1 created one unconditionally, which meant Windows always saw a radio
+    // that nothing was driving.
+    //
+    KdPrint(("winvhci: FDO %p ready, waiting for a userspace client\n", device));
 
     return STATUS_SUCCESS;
 }

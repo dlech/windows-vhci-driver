@@ -445,6 +445,42 @@ supersede both mechanisms.
 **Exit:** `vhcictl` prints Windows' full init sequence as the stack tries to bring the radio
 up. That transcript is the spec for M3.
 
+#### ✅ Achieved
+
+The seam is complete in both directions. A userspace client opens `\\.\WinVhci`, creates a
+radio with the control packet, receives the Windows stack's HCI commands as H4 frames, and
+injects events back:
+
+```
+CTRL ff 00 03 00                                     radio 3 created
+CMD  0x0c03  OGF 0x03 OCF 0x003  HCI_Reset                       -> accepted
+CMD  0x1009  OGF 0x04 OCF 0x009  Read_BD_ADDR                    -> accepted
+CMD  0x1002  OGF 0x04 OCF 0x002  Read_Local_Supported_Commands   -> Unknown Command
+CMD  0x1005  OGF 0x04 OCF 0x005  Read_Buffer_Size                -> Unknown Command
+   ... the stack restarts the sequence
+```
+
+**This is the M3 specification.** The stack needs, in order: `HCI_Reset`, `Read_BD_ADDR`,
+`Read_Local_Supported_Commands` (64-byte bitmask) and `Read_Buffer_Size` (ACL packet length,
+SCO packet length, ACL packet count, SCO packet count). It re-runs the whole sequence when a
+command is refused, so the loop stops as soon as all four are answered plausibly.
+
+Confirming the lifetime change: with no client attached, the radio does not exist at all —
+Device Manager shows only the `Virtual Bluetooth HCI Controller` FDO, and the Bluetooth Radio
+node appears on the control packet and disappears when the handle closes.
+
+#### Two traps worth remembering
+
+- **A synchronous `ReadFile` on the client side is a mistake.** It blocks indefinitely once the
+  stack goes quiet, so a bounded run never terminates and has to be killed - which also loses
+  its buffered output. `vhcictl` uses overlapped reads with a wait timeout.
+
+- **PowerShell's `-shl` shifts in the left operand's type.** `[byte]0x0c -shl 8` is `0`, not
+  `0x0c00`, so `03 0c 00` decoded as opcode `0x0003` instead of `0x0c03`. The client then
+  answered a Command Complete for an opcode the stack had never sent, the stack ignored it, and
+  the symptom looked exactly like the driver failing to deliver events. Cast to `[int]` before
+  shifting.
+
 ### M3 — A convincing controller
 
 The driver is a pipe; this milestone is about what's on the other end.
