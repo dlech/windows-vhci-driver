@@ -593,10 +593,55 @@ adds the missing handlers. Every one of those command classes already exists in 
 only the handlers were absent - and each is a configuration setter whose reply is a status
 byte, so the shim stores nothing and decides nothing. It belongs upstream in Bumble.
 
-**Still untested:** the Settings toggle, `BluetoothAdapter.GetDefaultAsync()`, and a
-`BluetoothLEAdvertisementWatcher` seeing advertisements from the `--peer` controller. Note also
-that the dual-mode feature mask advertises BR/EDR capabilities Bumble cannot honour, so BR/EDR
-operations will fail later; LE is the path that should actually work.
+#### ✅ The Windows APIs work, and a userspace device is discoverable
+
+```
+BluetoothAdapter.GetDefaultAsync()
+  adapter address           : F0:F1:F2:F3:F4:F5     (Bumble's)
+  IsLowEnergySupported      : True
+  IsClassicSupported        : True
+  IsCentralRoleSupported    : True
+  IsPeripheralRoleSupported : True
+  Radio state               : On
+
+DeviceInformation.FindAllAsync (unpaired BLE)
+  'Bumble'  BluetoothLE#BluetoothLEf0:f1:f2:f3:f4:f5-aa:bb:cc:dd:ee:ff
+```
+
+That last line is the whole chain: a BLE device advertised by a Python `bumble.device.Device`,
+across Bumble's simulated RF link, out through its virtual controller, over TCP, through
+`vhcibridge`, into `\\.\WinVhci`, up through `winvhci.sys` and `BthMini`/`BthPort`, and
+discovered by a Windows API - with no Bluetooth hardware anywhere.
+
+**Two Bumble-side fixes were needed, and neither was visible from the driver.**
+
+*Unadvertised commands are invisible.* Bumble implements `write_le_host_support`,
+`read_le_host_support` and `read_local_extended_features` but omits them from
+`supported_commands`. Windows only sends what a controller advertises, so it never sent them.
+
+*LE Supported States decides whether Windows pursues LE at all.* Bumble reports
+`ffff3fffff030000`; Windows reads it and then abandons the LE bring-up entirely - no
+`LE_Read_Buffer_Size`, no `Write_LE_Host_Support` - leaving `IsLowEnergySupported` False even
+though the controller advertised `LE_SUPPORTED_CONTROLLER` and Windows had happily issued other
+LE commands. Reporting `ffffffffffff0300` makes it continue. Which bits it actually insists on
+has not been narrowed down; the value used is empirical.
+
+The method that found both: compare against `vhcictl`, whose hand-written answers *did* produce
+`IsLowEnergySupported: True`. That proved the driver and the Windows stack were not at fault
+and reduced the problem to a diff between two sets of controller replies. Keeping the
+scaffolding client around paid for itself here.
+
+#### Remaining
+
+- The **Settings toggle** has not been looked at (it needs the GUI).
+- `BluetoothLEAdvertisementWatcher` is unverified. Windows PowerShell 5.1 cannot subscribe to
+  WinRT events at all, so `tools/win-ble-scan.ps1` compiles the watcher as C# instead - but its
+  `csc` invocation still fails on WinMD references for want of the .NET Framework targeting
+  pack in the guest. `FindAllAsync` already demonstrates discovery, so this is a second opinion
+  rather than a gap in the evidence.
+- The dual-mode LMP feature mask advertises BR/EDR capabilities Bumble cannot honour, so BR/EDR
+  operations will fail later. LE is the path expected to work, which suits Bleak.
+- `bumble-controller.py`'s `WindowsCompatController` should go upstream to Bumble.
 
 ### M4 — Make it survivable
 
