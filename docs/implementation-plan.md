@@ -556,11 +556,47 @@ length in `Read_Buffer_Size` (1021) and, by extension, anything derived from it.
 "initialisation completes" is necessary but not sufficient - none of those three has been
 tested yet.
 
-**And the real remaining work is the bridge, not more opcodes.** `vhcictl`'s answers are
-scaffolding. `tools/vhcibridge.ps1` is written and syntax-checked but has not yet been run
-against a live controller; doing that - RootCanal or Bumble on the VM host, reachable from the
-guest at slirp's `10.0.2.2` - is what actually closes M3. Adding further command handlers to
-`vhcictl` would be work on the wrong project.
+#### ✅ Bumble drives the stack through the bridge
+
+`tools/bumble-controller.py` (host) + `tools/vhcibridge.ps1` (guest) put a real emulator behind
+the driver, and Windows brings its whole stack up on it:
+
+```
+Bluetooth Radio                        OK   WINVHCI\RADIO\...
+Microsoft Bluetooth Enumerator         OK   BTH\MS_BTHBRB\...
+Bluetooth Device (RFCOMM Protocol TDI) OK   BTH\MS_RFCOMM\...
+```
+
+Windows pushes its own hostname into the controller (`Write_Local_Name`,
+`Write_Extended_Inquiry_Response` carrying "DESKTOP-..."), then enables scanning - steady-state
+operation, not initialisation.
+
+**Windows requires a dual-mode controller, and this is the part worth knowing.** Bumble
+defaults to LE-only, and the failure was isolated in three steps:
+
+| Bumble configuration | Result |
+| --- | --- |
+| Default: `BR_EDR_NOT_SUPPORTED`, BR/EDR feature octets zero | Windows stops dead after `Read_Local_Supported_Features` - no further commands, no retry |
+| `BR_EDR_NOT_SUPPORTED` cleared, feature octets still zero | Identical stop, in exactly the same place |
+| Realistic dual-mode LMP features (`bf fe cf fe db ff 7b 87`) | Proceeds to BR/EDR configuration |
+
+So the bit alone is not what matters: a controller claiming BR/EDR while supporting none of its
+mandatory features is rejected just as firmly as one that admits to being LE-only. This is the
+opposite of BlueZ, which accepts Bumble's LE-only controller unmodified - which is why
+[Bleak's VHCI integration tests](https://github.com/hbldh/bleak/blob/develop/tests/integration/README.rst)
+work on Linux with stock Bumble. Same architecture, stricter host stack.
+
+Once past that, Windows sends BR/EDR configuration commands that Bumble does not implement
+(`Write_Authentication_Enable` first), and a single `Unknown HCI Command` reply makes the stack
+restart its whole sequence indefinitely. `WindowsCompatController` in `tools/bumble-controller.py`
+adds the missing handlers. Every one of those command classes already exists in `bumble.hci` -
+only the handlers were absent - and each is a configuration setter whose reply is a status
+byte, so the shim stores nothing and decides nothing. It belongs upstream in Bumble.
+
+**Still untested:** the Settings toggle, `BluetoothAdapter.GetDefaultAsync()`, and a
+`BluetoothLEAdvertisementWatcher` seeing advertisements from the `--peer` controller. Note also
+that the dual-mode feature mask advertises BR/EDR capabilities Bumble cannot honour, so BR/EDR
+operations will fail later; LE is the path that should actually work.
 
 ### M4 — Make it survivable
 
