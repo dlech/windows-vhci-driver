@@ -100,34 +100,68 @@ selector is not where this section originally assumed. `IOCTL_BTHX_READ_HCI` spl
 contiguous `BTHX_HCI_READ_WRITE_CONTEXT` across the two METHOD_NEITHER pointers:
 
 ```
-Type3InputBuffer  ->  ULONG  DataLen      InputBufferLength  == 4
+Type3InputBuffer   ->  ULONG requestedType          InputBufferLength  == 4
 Type3InputBuffer+4 == Irp->UserBuffer
-                  ->  UCHAR  Type         OutputBufferLength == 1 + capacity
-                      UCHAR  Data[capacity]
+                   ->  BTHX_HCI_READ_WRITE_CONTEXT  OutputBufferLength == 5 + capacity
+                         ULONG DataLen
+                         UCHAR Type
+                         UCHAR Data[capacity]
 ```
 
-`Irp->UserBuffer` points **four bytes into the struct**, at `Type` — not at its start. Casting
-it to the whole struct reads `Data[3]` as `Type`, which produces a convincing but entirely
-fictional `Type == 0x00` on every read.
+Two things are easy to get wrong here, and both were got wrong before being measured:
 
-On the way in, the ULONG in `DataLen`'s position carries the **requested packet type**, not a
-length. Observed during bring-up:
+1. **The input buffer is not the context.** It is a bare ULONG holding the *requested packet
+   type* (`4` = event, `2` = ACL) — not a length, despite sitting where a `DataLen` would. It
+   is allocated immediately before the context, so `UserBuffer == Type3InputBuffer + 4`.
+
+2. **`Irp->UserBuffer` is the whole context**, starting at `DataLen`. An intermediate version
+   assumed it pointed at the `Type` field four bytes in. That reading is self-consistent enough
+   to look right, and it survives contact with the routing logic, but it puts the type byte
+   into `DataLen`'s low byte on the way out — so the stack silently rejects the event and
+   retries the command forever.
+
+The capacities are what settle it. Subtracting the 5-byte context header gives exactly **257**
+for event reads (2-byte HCI event header + 255 maximum payload) and exactly **1021** for ACL
+reads (`MaxAclTransferInSize`, the value we returned from `QUERY_CAPABILITIES`). The rejected
+reading gives 261 and 1025, which correspond to nothing. When a layout guess produces
+meaningful constants, it is probably right; when it produces arbitrary ones, it is probably
+wrong.
+
+Observed during bring-up:
 
 | requested | capacity | channel |
 | --- | --- | --- |
-| `4` (`HciPacketEvent`) | 261 | event |
-| `2` (`HciPacketAclData`) | 1025 | ACL |
-| `2` (`HciPacketAclData`) | 1025 | ACL |
+| `4` (`HciPacketEvent`) | 257 | event |
+| `2` (`HciPacketAclData`) | 1021 | ACL |
+| `2` (`HciPacketAclData`) | 1021 | ACL |
 
-The stack posts one event read and two ACL reads, and the ACL capacity is exactly
-`4 + MaxAclTransferInSize` — the value we returned from `QUERY_CAPABILITIES`. Route on the
-requested type; the capacity is a useful cross-check, and a disagreement means the assumption
-has broken.
+The stack posts one event read and two ACL reads, and replenishes a read as soon as one is
+completed. Route on the requested type; the capacity is a useful cross-check, and a
+disagreement means the assumption has broken.
+
+To complete a read: fill `Type`, `DataLen` and `Data` in the context, and complete the request
+with `Information = 5 + payload length`. `Data` carries the HCI packet *without* its H4 type
+byte, since the type travels in `Type`.
 
 This mattered concretely: an earlier build rejected the untyped-looking reads with
 `STATUS_NOT_SUPPORTED`, which left nothing pended to receive `HCI_Reset`'s Command Complete and
 stalled the radio at `CM_PROB_FAILED_POST_START`. Parking them correctly is what moved the
 radio to `Status: OK` / `CM_PROB_NONE`.
+
+**The rendezvous works.** With the layout right, completing one pended event read with a
+Command Complete for `HCI_Reset` makes the stack accept the reply and move on to the next
+command:
+
+```
+WRITE_HCI  opcode 0x0c03 (OGF 0x03 OCF 0x003)   HCI_Reset
+  -> Command Complete, 6 bytes
+WRITE_HCI  opcode 0x1009 (OGF 0x04 OCF 0x009)   Read_BD_ADDR
+```
+
+It then loops Reset -> Read_BD_ADDR every four seconds, because `Read_BD_ADDR` must return a
+6-byte address and the in-driver stopgap answers every command with an empty Command Complete.
+Answering it properly is M3's job, driven from userspace via M2 - not more canned replies in
+the driver.
 
 Both directions follow the sample's rendezvous rule, which is worth stating explicitly
 because it is the invariant the whole driver rests on:

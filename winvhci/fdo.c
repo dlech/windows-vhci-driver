@@ -181,6 +181,121 @@ WinVhciLogHciPacket(
     }
 }
 
+static NTSTATUS
+WinVhciDeliverEvent(
+    _In_ PWINVHCI_FDO_CONTEXT       Ctx,
+    _In_reads_bytes_(Length) const UCHAR *Payload,
+    _In_ ULONG                      Length
+    )
+/*++
+
+Routine Description:
+
+    Completes one pended IOCTL_BTHX_READ_HCI from the event queue with an HCI
+    event, i.e. the controller-to-host direction of the rendezvous rule in
+    implementation-plan.md 3.3.
+
+    Payload is the HCI event WITHOUT its H4 type byte - the type travels in the
+    context's Type field instead.
+
+Return Value:
+
+    STATUS_NO_MORE_ENTRIES if no read is pended, in which case the caller should
+    treat the event as dropped (M2 gives it a backlog list to sit in instead).
+
+--*/
+{
+    WDFREQUEST                   request;
+    WDF_REQUEST_PARAMETERS       params;
+    PIRP                         irp;
+    PBTHX_HCI_READ_WRITE_CONTEXT out;
+    ULONG                        capacity;
+    NTSTATUS                     status;
+
+    status = WdfIoQueueRetrieveNextRequest(Ctx->ReadEventQueue, &request);
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("winvhci: no event read pended, dropping %u byte event\n", Length));
+        return STATUS_NO_MORE_ENTRIES;
+    }
+
+    WDF_REQUEST_PARAMETERS_INIT(&params);
+    WdfRequestGetParameters(request, &params);
+
+    irp = WdfRequestWdmGetIrp(request);
+    out = (PBTHX_HCI_READ_WRITE_CONTEXT)irp->UserBuffer;
+
+    if (out == NULL ||
+        params.Parameters.DeviceIoControl.OutputBufferLength <
+            WINVHCI_HCI_CONTEXT_HEADER_SIZE) {
+        WdfRequestComplete(request, STATUS_INVALID_PARAMETER);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    capacity = (ULONG)params.Parameters.DeviceIoControl.OutputBufferLength -
+               WINVHCI_HCI_CONTEXT_HEADER_SIZE;
+    if (capacity < Length) {
+        KdPrint(("winvhci: event too big for read buffer (%u > %u)\n", Length, capacity));
+        WdfRequestComplete(request, STATUS_BUFFER_TOO_SMALL);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    //
+    // UserBuffer is the whole context: DataLen, then Type, then Data.
+    //
+    out->Type    = (UCHAR)HciPacketEvent;
+    out->DataLen = Length;
+    RtlCopyMemory(out->Data, Payload, Length);
+
+    KdPrint(("winvhci: delivered event, %u bytes (capacity %u)\n", Length, capacity));
+
+    WdfRequestCompleteWithInformation(request,
+                                      STATUS_SUCCESS,
+                                      WINVHCI_HCI_CONTEXT_HEADER_SIZE + Length);
+
+    return STATUS_SUCCESS;
+}
+
+static VOID
+WinVhciAnswerCommand(
+    _In_ PWINVHCI_FDO_CONTEXT Ctx,
+    _In_ USHORT               Opcode
+    )
+/*++
+
+Routine Description:
+
+    STOPGAP. Answers a host command with a Command Complete carrying status
+    "success" and no return parameters.
+
+    This exists only to get the stack past HCI_Reset so its full initialisation
+    sequence can be observed - that transcript is the specification for M3. It
+    is not a controller model: commands that must return parameters (Read
+    Local Version, Read BD_ADDR, Read Buffer Size ...) will be answered with a
+    reply that is well-formed but empty, which the stack is entitled to reject.
+
+    M2 replaces this entirely by handing commands to userspace and letting the
+    simulator decide the reply.
+
+--*/
+{
+    UCHAR event[6];
+
+    //
+    // Command Complete (7.7.14): event code, parameter length, then
+    // Num_HCI_Command_Packets, the opcode being completed, and the status.
+    //
+    event[0] = 0x0E;                      // HCI_Command_Complete
+    event[1] = 0x04;                      // parameter total length
+    event[2] = 0x01;                      // controller can accept 1 more command
+    event[3] = (UCHAR)(Opcode & 0xFF);    // opcode, little endian
+    event[4] = (UCHAR)(Opcode >> 8);
+    event[5] = 0x00;                      // status = success
+
+    KdPrint(("winvhci: answering opcode 0x%04x with Command Complete\n", Opcode));
+
+    (VOID)WinVhciDeliverEvent(Ctx, event, sizeof(event));
+}
+
 static VOID
 WinVhciBthxDispatch(
     _In_ WDFQUEUE   Queue,
@@ -349,17 +464,35 @@ WinVhciBthxDispatch(
         WinVhciLogHciPacket(w->Type, w->Data, w->DataLen);
 
         //
-        // M1 swallows host->controller traffic. M2 hands it to userspace.
+        // Complete the write BEFORE answering it. The event is delivered by
+        // completing a different, already-pended request, so the order is not
+        // forced - but answering first would mean the stack could see the
+        // Command Complete for a command whose own write had not yet completed.
         //
         info   = w->DataLen;
         status = STATUS_SUCCESS;
+
+        //
+        // STOPGAP, to be replaced by the userspace data path in M2: answer
+        // commands here in the driver so the stack advances past HCI_Reset and
+        // reveals the rest of its initialisation sequence, which is the
+        // transcript M3 is specified from.
+        //
+        if (w->Type == HciPacketCommand && w->DataLen >= 3) {
+            USHORT opcode = (USHORT)(w->Data[0] | (w->Data[1] << 8));
+
+            WdfRequestCompleteWithInformation(Request, status, info);
+            WinVhciAnswerCommand(ctx, opcode);
+            return;
+        }
+
         break;
     }
 
     case IOCTL_BTHX_READ_HCI: {
 
         //
-        // MEASURED layout - see WINVHCI_READ_TYPE_OFFSET in winvhci.h. The
+        // MEASURED layout - see WINVHCI_READ_TYPE_WORD_SIZE in winvhci.h. The
         // context is ONE contiguous struct starting at Type3InputBuffer, and
         // UserBuffer points at its Type field, four bytes in. An earlier build
         // cast UserBuffer to the whole struct, so it read Data[3] as Type,
@@ -373,7 +506,7 @@ WinVhciBthxDispatch(
         ULONG                        capacity;
 
         if (r == NULL || InputBufferLength < sizeof(ULONG) ||
-            outBuf == NULL || OutputBufferLength < sizeof(UCHAR)) {
+            outBuf == NULL || OutputBufferLength < WINVHCI_HCI_CONTEXT_HEADER_SIZE) {
             KdPrint(("winvhci: READ_HCI bad buffers (in %p/%u out %p/%u)\n",
                      inBuf, (ULONG)InputBufferLength,
                      outBuf, (ULONG)OutputBufferLength));
@@ -386,9 +519,9 @@ WinVhciBthxDispatch(
         // the two buffers independently, everything below silently corrupts
         // memory. Fail loudly instead.
         //
-        if ((PUCHAR)outBuf != (PUCHAR)inBuf + WINVHCI_READ_TYPE_OFFSET) {
+        if ((PUCHAR)outBuf != (PUCHAR)inBuf + WINVHCI_READ_TYPE_WORD_SIZE) {
             KdPrint(("winvhci: READ_HCI UNEXPECTED LAYOUT: out %p != in %p + %u\n",
-                     outBuf, inBuf, (ULONG)WINVHCI_READ_TYPE_OFFSET));
+                     outBuf, inBuf, (ULONG)WINVHCI_READ_TYPE_WORD_SIZE));
             WinVhciTraceUlong(device, L"WvReadLayoutBad", 1);
             status = STATUS_INVALID_DEVICE_REQUEST;
             break;
@@ -411,7 +544,7 @@ WinVhciBthxDispatch(
         // cross-check: if the two ever disagree, the assumption has broken and
         // that is worth seeing rather than silently misrouting a stream.
         //
-        capacity = (ULONG)OutputBufferLength - sizeof(UCHAR);
+        capacity = (ULONG)OutputBufferLength - WINVHCI_HCI_CONTEXT_HEADER_SIZE;
 
         switch (r->DataLen) {
         case HciPacketEvent:
@@ -428,12 +561,12 @@ WinVhciBthxDispatch(
             KdPrint(("winvhci: READ_HCI unexpected requested type %u, "
                      "falling back to capacity\n", r->DataLen));
             WinVhciTraceUlong(device, L"WvReadOddType", r->DataLen);
-            target = (capacity >= WINVHCI_ACL_READ_CAPACITY) ? ctx->ReadDataQueue
+            target = (capacity >= WINVHCI_MAX_ACL_TRANSFER_IN) ? ctx->ReadDataQueue
                                                              : ctx->ReadEventQueue;
             break;
         }
 
-        if ((target == ctx->ReadDataQueue) != (capacity >= WINVHCI_ACL_READ_CAPACITY)) {
+        if ((target == ctx->ReadDataQueue) != (capacity >= WINVHCI_MAX_ACL_TRANSFER_IN)) {
             KdPrint(("winvhci: READ_HCI type/capacity DISAGREE (type %u capacity %u)\n",
                      r->DataLen, capacity));
             WinVhciTraceUlong(device, L"WvReadMismatch", capacity);

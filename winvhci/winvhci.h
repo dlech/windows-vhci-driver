@@ -56,28 +56,35 @@ Environment:
     FIELD_OFFSET(BTHX_HCI_READ_WRITE_CONTEXT, Data)
 
 //
-// How IOCTL_BTHX_READ_HCI actually lays its buffers out. MEASURED, and not what
-// implementation-plan.md 3.3 assumed:
+// How IOCTL_BTHX_READ_HCI actually lays its buffers out. MEASURED:
 //
-//   Type3InputBuffer -> ULONG DataLen        InputBufferLength  == 4
-//   Irp->UserBuffer  -> UCHAR Type           OutputBufferLength == 1 + capacity
-//                       UCHAR Data[capacity]
+//   Type3InputBuffer -> ULONG requestedType    InputBufferLength  == 4
+//   Irp->UserBuffer  -> BTHX_HCI_READ_WRITE_CONTEXT
+//                         ULONG DataLen        OutputBufferLength == 5 + capacity
+//                         UCHAR Type
+//                         UCHAR Data[capacity]
 //
-// It is ONE contiguous BTHX_HCI_READ_WRITE_CONTEXT beginning at
-// Type3InputBuffer, with UserBuffer pointing at its Type field - four bytes
-// into the struct, not at the start. Casting UserBuffer to the whole struct
-// reads Data[3] as Type, which is where the phantom "Type == 0x00" came from.
+// The two live in ONE allocation with the type word immediately before the
+// context, so UserBuffer == Type3InputBuffer + 4. That adjacency is checked at
+// runtime, because everything below writes through these pointers.
 //
-#define WINVHCI_READ_TYPE_OFFSET FIELD_OFFSET(BTHX_HCI_READ_WRITE_CONTEXT, Type)
+// The requested type is a BTHX_HCI_PACKET_TYPE value (4 = event, 2 = ACL), not
+// a length, despite occupying the position a DataLen would.
+//
+// The capacities confirm the reading: subtracting the 5-byte context header
+// gives exactly 257 for events (2-byte HCI event header + 255 max payload) and
+// exactly MaxAclTransferInSize for ACL. An earlier version treated UserBuffer
+// as pointing at the Type field, which yields 261 and 1025 - numbers that mean
+// nothing - and wrote the type byte into DataLen's low byte, so the stack
+// rejected the event and retried HCI_Reset.
+//
+#define WINVHCI_READ_TYPE_WORD_SIZE sizeof(ULONG)
 
 //
-// Read capacity tells the channels apart, since Type is not set on the way in.
-// The stack posts one small buffer for events and larger ones for ACL data,
-// and the ACL capacity is exactly the transfer size we reported in
-// QUERY_CAPABILITIES plus the 4-byte ACL header.
+// Largest HCI event: 2-byte header (code + parameter length) plus a parameter
+// length that cannot exceed 255.
 //
-#define WINVHCI_ACL_HEADER_SIZE   4
-#define WINVHCI_ACL_READ_CAPACITY (WINVHCI_ACL_HEADER_SIZE + WINVHCI_MAX_ACL_TRANSFER_IN)
+#define WINVHCI_MAX_EVENT_SIZE 257
 
 //
 // FDO context. For M1 this holds only what is needed to accept and park the
