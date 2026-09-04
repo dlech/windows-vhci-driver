@@ -33,10 +33,12 @@ $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() |
     })[0]
 
 function Await {
-    param($Operation, $ResultType)
+    param($Operation, $ResultType, [int]$TimeoutMs = 15000)
     $method = $asTaskGeneric.MakeGenericMethod($ResultType)
     $task   = $method.Invoke($null, @($Operation))
-    if (-not $task.Wait(15000)) { throw 'WinRT operation timed out' }
+    # A BLE DeviceInformation.FindAllAsync actually performs a scan, so it
+    # needs far longer than a property read; callers pass their own timeout.
+    if (-not $task.Wait($TimeoutMs)) { throw "WinRT operation timed out after ${TimeoutMs}ms" }
     return $task.Result
 }
 
@@ -107,6 +109,13 @@ $watcher.ScanningMode = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEScan
 # a different thread.
 $script:seen = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
 
+# Windows PowerShell 5.1 cannot subscribe to WinRT events at all -
+# Register-ObjectEvent fails with "cannot subscribe to Windows RT events" for
+# any TypedEventHandler. So this check is best-effort, and must not abort the
+# script: the event-free discovery check below is the one that actually matters
+# here. (A real client - Bleak, or any C#/C++ app - has no such limitation.)
+$subscription = $null
+try {
 $subscription = Register-ObjectEvent -InputObject $watcher -EventName Received -Action {
     $args0 = $EventArgs
     $a = ('{0:X12}' -f $args0.BluetoothAddress) -replace '(..)(?=.)', '$1:'
@@ -118,18 +127,24 @@ $subscription = Register-ObjectEvent -InputObject $watcher -EventName Received -
     })
 }
 
-try {
-    $watcher.Start()
-    Write-Host "  watcher status: $($watcher.Status)"
-    $deadline = (Get-Date).AddSeconds($ScanSeconds)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
-        if ($script:seen.Count -gt 0) { break }   # first hit is enough
+    try {
+        $watcher.Start()
+        Write-Host "  watcher status: $($watcher.Status)"
+        $deadline = (Get-Date).AddSeconds($ScanSeconds)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            if ($script:seen.Count -gt 0) { break }   # first hit is enough
+        }
+        Start-Sleep -Seconds 2
+        $watcher.Stop()
+    } finally {
+        if ($subscription) {
+            Unregister-Event -SubscriptionId $subscription.Id -ErrorAction SilentlyContinue
+        }
     }
-    Start-Sleep -Seconds 2
-    $watcher.Stop()
-} finally {
-    Unregister-Event -SubscriptionId $subscription.Id -ErrorAction SilentlyContinue
+} catch {
+    Write-Host "  watcher unavailable from PowerShell: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host '  (this is a PowerShell limitation, not a driver problem - see check 4)' -ForegroundColor DarkGray
 }
 
 if ($script:seen.Count -eq 0) {
@@ -155,7 +170,7 @@ Write-Host '=== 4. DeviceInformation.FindAllAsync (no event handler) ===' -Foreg
 try {
     $null = [Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType = WindowsRuntime]
     $selector = [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($false)
-    $found = Await ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($selector)) ([Windows.Devices.Enumeration.DeviceInformationCollection])
+    $found = Await ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($selector)) ([Windows.Devices.Enumeration.DeviceInformationCollection]) 60000
     if ($found.Count -eq 0) {
         Write-Host '  no unpaired BLE devices known to Windows' -ForegroundColor Yellow
     } else {

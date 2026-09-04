@@ -51,7 +51,56 @@ class WindowsCompatController(Controller):
     status byte. So this is a compatibility shim, not a controller: it stores
     nothing and decides nothing. It is the kind of gap that belongs upstream in
     Bumble rather than here.
+
+    It also FIXES THE SUPPORTED-COMMANDS BITMASK, which turned out to matter
+    more than the handlers. Bumble implements write_le_host_support,
+    read_le_host_support and read_local_extended_features but does not list them
+    in supported_commands. Windows only sends a command its controller
+    advertises, so it never sent Write_LE_Host_Support, LE host support was
+    never enabled, and BluetoothAdapter.IsLowEnergySupported stayed False even
+    though the controller reported LE_SUPPORTED_CONTROLLER and Windows happily
+    issued other LE commands. An unadvertised-but-implemented command is
+    invisible.
     """
+
+    # LE Supported States (Core spec 7.8.27).
+    #
+    # Bumble reports ffff3fffff030000. Windows queries this and then abandons
+    # the LE bring-up: it never sends LE_Read_Buffer_Size,
+    # LE_Read_White_List_Size, Write_LE_Host_Support or
+    # LE_Read_Advertising_Channel_Tx_Power, and BluetoothAdapter reports
+    # IsLowEnergySupported = False. A controller reporting the value below
+    # instead makes Windows continue and end up with a fully capable adapter
+    # (IsLowEnergySupported, IsCentralRoleSupported and
+    # IsPeripheralRoleSupported all True), so this is where the two diverge.
+    #
+    # Which specific state bits Windows insists on has not been narrowed down;
+    # this is the empirical value that works, not a claim about the minimum.
+    le_states = bytes.fromhex('ffffffffffff0300')
+
+    supported_commands = Controller.supported_commands | {
+        # Implemented by Bumble, but missing from its bitmask.
+        hci.HCI_WRITE_LE_HOST_SUPPORT_COMMAND,
+        hci.HCI_READ_LE_HOST_SUPPORT_COMMAND,
+        hci.HCI_READ_LOCAL_EXTENDED_FEATURES_COMMAND,
+        hci.HCI_WRITE_CLASS_OF_DEVICE_COMMAND,
+        hci.HCI_WRITE_EXTENDED_INQUIRY_RESPONSE_COMMAND,
+        # Implemented by the handlers below.
+        hci.HCI_WRITE_AUTHENTICATION_ENABLE_COMMAND,
+        hci.HCI_WRITE_PAGE_TIMEOUT_COMMAND,
+        hci.HCI_WRITE_PAGE_SCAN_ACTIVITY_COMMAND,
+        hci.HCI_WRITE_INQUIRY_SCAN_ACTIVITY_COMMAND,
+        hci.HCI_WRITE_INQUIRY_MODE_COMMAND,
+        hci.HCI_WRITE_SCAN_ENABLE_COMMAND,
+        hci.HCI_WRITE_LOCAL_NAME_COMMAND,
+        hci.HCI_WRITE_SIMPLE_PAIRING_MODE_COMMAND,
+        hci.HCI_WRITE_SECURE_CONNECTIONS_HOST_SUPPORT_COMMAND,
+        hci.HCI_WRITE_CONNECTION_ACCEPT_TIMEOUT_COMMAND,
+        hci.HCI_WRITE_PAGE_SCAN_TYPE_COMMAND,
+        hci.HCI_WRITE_VOICE_SETTING_COMMAND,
+        hci.HCI_WRITE_SYNCHRONOUS_FLOW_CONTROL_ENABLE_COMMAND,
+        hci.HCI_READ_INQUIRY_RESPONSE_TRANSMIT_POWER_LEVEL_COMMAND,
+    }
 
     def on_hci_write_authentication_enable_command(self, _command):
         return hci.HCI_StatusReturnParameters(hci.HCI_ErrorCode.SUCCESS)
