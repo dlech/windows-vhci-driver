@@ -89,6 +89,10 @@ counter records that it happened.
 Observed during bring-up: the stack posts **one** event read and **two** ACL reads, and
 replenishes a read as soon as one is completed.
 
+Both channels are exercised. The event channel carries the whole initialisation sequence and
+advertising reports; the ACL channel carries ATT, which a GATT read or write from a Windows
+application drives end to end.
+
 ---
 
 ## The BTHX contract, as measured

@@ -108,6 +108,23 @@ The three controller-side requirements this uncovered — dual-mode LMP features
 commands in the supported-commands bitmask, and LE Supported States — are documented in
 [controller-requirements.md](controller-requirements.md).
 
+**GATT works too, which is what proves the ACL path.** Everything above runs on HCI commands,
+events and advertising reports; a GATT operation is ATT over L2CAP over ACL, so it is the first
+thing to exercise the driver's second read channel and the `MaxAclTransferInSize` it has
+claimed since M1:
+
+```
+GATT service discovery (uncached)   status: Success
+    7a9b0001-4c1d-4e2a-9f3b-1d2c3e4f5a6b   (the peer's service)
+  read   17 bytes: 'hello from bumble'
+  write  18 bytes: Success        -> arrives at the Python peer
+```
+
+`tools/win-ble-connect.ps1` runs this. Getting there needed three more controller-side fixes
+and no driver changes at all: connection-time command handlers, an ACL routing fix in Bumble's
+simulated link, and raw-byte Command Complete replies. All are in
+[controller-requirements.md](controller-requirements.md).
+
 **Not finished:**
 
 - The **Settings Bluetooth toggle** has not been looked at; it needs the GUI.
@@ -159,7 +176,9 @@ tools/        vhci-io.ps1           shared overlapped-I/O helper and H4 framing
               vhcibridge.ps1        \\.\WinVhci <-> TCP
               vhcictl.ps1           diagnostic client
               bumble-controller.py  Bumble + Windows-compatibility shim
+              winrt-await.ps1       awaiting WinRT async ops from PowerShell
               win-ble-test.ps1      Windows Bluetooth API checks
+              win-ble-connect.ps1   GATT connect, read and write - the ACL path
               win-ble-scan.ps1      event-driven watcher (NOT WORKING - see M3)
 
 build/        qemu-*.ps1            create, run, snapshot, restart the guest

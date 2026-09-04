@@ -7,20 +7,22 @@ A userspace process supplies the controller behaviour; Windows sees a real local
 radio, with the whole in-box stack above it operating normally.
 
 **Status: working.** Windows brings its full Bluetooth stack up on the virtual radio, reports a
-fully capable dual-mode adapter, and discovers a BLE device advertised from a Python process:
+fully capable dual-mode adapter, discovers a BLE device advertised from a Python process, and
+connects to it over GATT:
 
 ```
 IsLowEnergySupported : True    IsClassicSupported : True
 IsCentralRoleSupported : True  IsPeripheralRoleSupported : True
 
-DeviceInformation.FindAllAsync (unpaired BLE)
-  'Bumble'  BluetoothLE#BluetoothLEf0:f1:f2:f3:f4:f5-aa:bb:cc:dd:ee:ff
+GATT service discovery (uncached)   status: Success
+  read   17 bytes: 'hello from bumble'
+  write  18 bytes: Success
 ```
 
-That last line is the whole chain: a BLE device advertised by a `bumble.device.Device`, across
-Bumble's simulated RF link, out through its virtual controller, over TCP, through
-`vhcibridge.ps1`, into `\\.\WinVhci`, up through `winvhci.sys` and `BthMini`/`BthPort`, and
-discovered by a Windows API — with no Bluetooth hardware anywhere.
+Those last two lines are the whole chain: a characteristic on a `bumble.device.Device`, read and
+written by a Windows application, across Bumble's simulated RF link, out through its virtual
+controller, over TCP, through `vhcibridge.ps1`, into `\\.\WinVhci`, up through `winvhci.sys`
+and `BthMini`/`BthPort` — with no Bluetooth hardware anywhere.
 
 ## How it works
 
@@ -55,8 +57,12 @@ Then, with the driver installed:
 ```
 host:   python tools/bumble-controller.py --peer --dual-mode
 guest:  .\vhcibridge.ps1 -RemoteHost 10.0.2.2 -Port 6402
-guest:  .\win-ble-test.ps1
+guest:  .\win-ble-test.ps1        # adapter capabilities and discovery
+guest:  .\win-ble-connect.ps1     # GATT connect, read and write
 ```
+
+The bridge must stay running for as long as the radio is wanted: closing the handle to
+`\\.\WinVhci` removes the radio, exactly as closing `/dev/vhci` does on Linux.
 
 ## Documentation
 
