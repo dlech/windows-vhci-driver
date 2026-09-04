@@ -1,7 +1,8 @@
 # Take / list / revert qcow2 snapshots of the guest disk.
 #
 # These are offline snapshots: the VM must be shut down. A live `savevm` is not
-# possible here because the vvfat file-channel disk does not support snapshots.
+# possible here because the removable media attached to the guest do not support
+# snapshots.
 #
 #   .\qemu-snapshot.ps1 -List
 #   .\qemu-snapshot.ps1 -Take clean

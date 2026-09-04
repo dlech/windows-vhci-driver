@@ -49,8 +49,8 @@ Environment:
 // trace is worse than none. This path always exists or can be created.
 //
 // KdPrint via DebugView is the better channel for a live transcript (see
-// docs/implementation-plan.md), so these breadcrumbs are for state that must
-// survive a crash or be readable long after the fact.
+// docs/development.md), so these breadcrumbs are for state that must survive a
+// crash or be readable long after the fact.
 //
 // Diagnostic scaffolding for bring-up, not a permanent logging design: it costs
 // a registry write per request, far too expensive once the data path carries
@@ -557,8 +557,9 @@ WinVhciBthxDispatch(
         //     requested 4  capacity 261    -> event
         //     requested 2  capacity 1025   -> ACL   (= 4 + MaxAclTransferInSize)
         //
-        // So implementation-plan.md 3.3 was right that Type selects the
-        // channel; it is simply in the input buffer rather than the output one.
+        // So the two-queue model was right that Type selects the channel; the
+        // type is simply in the input buffer rather than the output one. See
+        // docs/design.md, "Where the read type actually lives".
         //
         // Route on the explicit request, and keep the capacity as a
         // cross-check: if the two ever disagree, the assumption has broken and

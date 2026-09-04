@@ -5,8 +5,8 @@
 
 [CmdletBinding()]
 param(
-    # Defaults to wherever this script is running from - i.e. the QEMU VVFAT
-    # drive the host stages with build\stage-share.ps1.
+    # Defaults to wherever this script is running from - i.e. the share disc
+    # the host authors with build\make-share-iso.ps1.
     [string]$Share,
     [string]$Staging = 'C:\winvhci'
 )
@@ -28,7 +28,7 @@ $devcon = Join-Path $Share 'tools\devcon.exe'
 
 Write-Host "Using staged files from: $Share" -ForegroundColor Cyan
 foreach ($p in @($pkgSrc, $cer, $devcon)) {
-    if (-not (Test-Path $p)) { throw "Missing: $p  (run build\stage-share.ps1 on the host and relaunch the VM)" }
+    if (-not (Test-Path $p)) { throw "Missing: $p  (run build\make-share-iso.ps1 on the host and relaunch the VM)" }
 }
 
 Write-Host '== Checking test signing state ==' -ForegroundColor Cyan

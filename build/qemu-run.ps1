@@ -108,7 +108,7 @@ $qemuArgs = @(
     # devices. The fix is the NetKVM driver from the virtio-win ISO, which does
     # ship an ARM64 build, so virtio-net-pci is the NIC to present: once NetKVM
     # is installed this becomes a working adapter and RDP arrives on $RdpPort.
-    # Until then the guest has no network and files come over the vvfat USB disk.
+    # Until then the guest has no network and files come over the share disc.
     # Two forwards: RDP for a human console, SSH for scripted control from the
     # host (build -> install -> observe -> revert without touching the guest).
     '-netdev', "user,id=n0,hostfwd=tcp:127.0.0.1:$RdpPort-:3389,hostfwd=tcp:127.0.0.1:$SshPort-:22"

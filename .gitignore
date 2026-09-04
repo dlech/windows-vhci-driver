@@ -44,7 +44,9 @@ winvhci/winvhci.inf
 *.iso
 *.fd
 
-# Python virtualenvs for the controller emulator (installed per machine).
+# Python virtualenvs for the controller emulator (installed per machine), and
+# tool caches.
 bumble-venv/
 .venv/
 __pycache__/
+.mypy_cache/

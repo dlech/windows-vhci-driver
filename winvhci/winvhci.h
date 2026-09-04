@@ -8,7 +8,7 @@ Abstract:
 
     Shared declarations for winvhci, a virtual Bluetooth HCI controller.
 
-    Topology (see docs/implementation-plan.md 3.1):
+    Topology (see docs/design.md, "Topology"):
 
         ROOT\WINVHCI -- winvhci.sys FDO
                             |
@@ -41,9 +41,9 @@ Environment:
 #define WINVHCI_RADIO_COMPAT_ID   L"MS_BTHX_BTHMINI"
 
 //
-// Capabilities reported to BthPort. See implementation-plan.md 3.6 - ScoSupport
-// is the value most likely to be rejected, so it is the first thing to change
-// if the stack refuses to come up.
+// Capabilities reported to BthPort. See docs/design.md, "Capabilities" -
+// ScoSupport is the value most likely to be rejected, so it is the first thing
+// to change if the stack refuses to come up.
 //
 #define WINVHCI_MAX_ACL_TRANSFER_IN 1021
 
@@ -89,7 +89,7 @@ Environment:
 //
 // H4 packet type bytes, as used on the userspace wire. These are the same
 // values as BTHX_HCI_PACKET_TYPE for the three types the DDI supports, which is
-// why no translation table is needed (implementation-plan.md 3.5).
+// why no translation table is needed (docs/design.md, "Packet types").
 //
 #define WINVHCI_H4_COMMAND 0x01
 #define WINVHCI_H4_ACL     0x02
@@ -139,14 +139,14 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     //
     // Two INDEPENDENT read channels, selected by the Type field of each
     // IOCTL_BTHX_READ_HCI. Merging them misroutes packets and stalls the stack
-    // (implementation-plan.md 3.3).
+    // (docs/design.md, "Queues and the rendezvous").
     //
     WDFQUEUE    ReadEventQueue;     // Type == HciPacketEvent
     WDFQUEUE    ReadDataQueue;      // Type == HciPacketAclData
 
     //
     // The userspace side of the seam: \\.\WinVhci, opened exclusively by one
-    // simulator at a time (implementation-plan.md 3.4).
+    // simulator at a time (docs/design.md, "Userspace interface").
     //
     WDFQUEUE      UserReadQueue;    // manual: pended ReadFile
     WDFFILEOBJECT Owner;            // the one open handle, or NULL

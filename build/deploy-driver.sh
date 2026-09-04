@@ -9,6 +9,7 @@
 #
 #   ./deploy-driver.sh                 build, copy, install, restart device
 #   ./deploy-driver.sh --capture 20    ... and capture a kernel trace
+#   ./deploy-driver.sh --no-build      deploy whatever is already built
 #
 # Requires: guest reachable on 127.0.0.1:2222, askpass helper for password auth.
 
@@ -31,7 +32,45 @@ SCPOPTS="-P $GUEST_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/n
 TARGET="$GUEST_USER@127.0.0.1"
 
 CAPTURE=0
-[ "$1" = "--capture" ] && CAPTURE="${2:-20}"
+BUILD=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --capture)  CAPTURE="${2:-20}"; shift 2 ;;
+        --no-build) BUILD=0; shift ;;
+        *)          echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+
+if [ "$BUILD" = 1 ]; then
+    # Two things have to be true of the MSBuild we pick.
+    #
+    # It must be the ARM64 one: the default Bin\MSBuild.exe is x86 and the WDK
+    # ships infverif.dll only for arm64 and x64, so an x86 MSBuild fails with
+    # "Unable to load DLL 'x86\InfVerif.dll'".
+    #
+    # And its installation must carry the WDK's platform toolset. More than one
+    # Visual Studio can be installed while only one has the WDK VSIX, and the
+    # others fail with MSB8020 "build tools for WindowsKernelModeDriver10.0
+    # cannot be found" - which reads like a missing WDK rather than the wrong
+    # MSBuild. So select on the toolset directory, not on version order.
+    if [ -z "$MSBUILD" ]; then
+        for ts in "/c/Program Files/Microsoft Visual Studio"/*/*/MSBuild/Microsoft/VC/*/Platforms/ARM64/PlatformToolsets/WindowsKernelModeDriver10.0; do
+            [ -d "$ts" ] || continue
+            vs="${ts%%/MSBuild/*}"
+            if [ -x "$vs/MSBuild/Current/Bin/arm64/MSBuild.exe" ]; then
+                MSBUILD="$vs/MSBuild/Current/Bin/arm64/MSBuild.exe"
+            fi
+        done
+    fi
+    [ -x "$MSBUILD" ] || {
+        echo "no ARM64 MSBuild with the WDK toolset found; set MSBUILD" >&2
+        exit 1
+    }
+
+    echo "==> building"
+    "$MSBUILD" "$(cygpath -w "$REPO/winvhci/winvhci.vcxproj")" \
+        -p:Configuration=Debug -p:Platform=ARM64 -v:minimal -nologo
+fi
 
 echo "==> copying package"
 ssh $SSHOPTS "$TARGET" 'New-Item -ItemType Directory C:\pkg -Force | Out-Null'

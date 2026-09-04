@@ -13,7 +13,11 @@ param(
     [string]$VmDir    = 'C:\Users\extra\qemu-vms\winvhci',
     [string]$Disk     = 'win11.qcow2',
     [string]$DiskSize = '64G',
-    [string]$CredFile = 'C:\Users\extra\AppData\Local\Temp\claude\c--Users-extra-work-windows-vhci-driver\3d2bbd61-05fd-474a-90ab-4ce686d3af08\scratchpad\guest-cred.txt',
+    # A file holding the guest account password on its first line. Deliberately
+    # outside the repository: the answer file here carries a __PASSWORD__
+    # placeholder and the real value is substituted at run time, so no password
+    # is ever committed.
+    [string]$CredFile = (Join-Path $env:LOCALAPPDATA 'winvhci\guest-cred.txt'),
     [int]   $MemoryMB = 8192,
     [int]   $Cpus     = 4,
     [int]   $RdpPort  = 3390,

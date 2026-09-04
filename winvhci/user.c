@@ -8,14 +8,14 @@ Abstract:
 
     The userspace side of the seam: \\.\WinVhci, which behaves like Linux's
     /dev/vhci so that a simulator written against vhci is a path change rather
-    than a rewrite (implementation-plan.md 3.4).
+    than a rewrite (docs/design.md, "Userspace interface").
 
         WriteFile   controller -> host    04 <event> | 02 <acl> | FF <opcode>
         ReadFile    host -> controller    01 <cmd>   | 02 <acl> | FF FF <opcode> <id_lo> <id_hi>
 
     The first byte of every transfer is the H4 packet type. No translation is
     needed between H4 and BTHX_HCI_PACKET_TYPE because the values coincide
-    (implementation-plan.md 3.5).
+    (docs/design.md, "Packet types").
 
     Both directions obey the same rendezvous rule:
 
@@ -371,7 +371,7 @@ WinVhciEvtIoWrite(
         //
         // Commands travel host -> controller. A simulator sending one is
         // confused about which end it is; say so rather than quietly dropping
-        // it (implementation-plan.md 3.5 - direction is enforced).
+        // it (docs/design.md, "Packet types" - direction is enforced).
         //
         KdPrint(("winvhci: userspace sent a COMMAND packet; wrong direction\n"));
         status = STATUS_INVALID_PARAMETER;
