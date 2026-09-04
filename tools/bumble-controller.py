@@ -31,6 +31,8 @@ import sys
 
 from bumble import hci
 from bumble.controller import Controller
+from bumble.device import Device
+from bumble.host import Host
 from bumble.link import LocalLink
 
 from bumble.transport import open_transport
@@ -134,6 +136,7 @@ async def run(
     with_peer: bool,
     address: str,
     peer_address: str,
+    peer_name: str,
     dual_mode: bool,
 ) -> None:
     # A LocalLink is Bumble's simulated radio medium. Controllers attached to
@@ -144,13 +147,30 @@ async def run(
     spec = f"tcp-server:{host}:{port}"
     print(f"listening for an HCI client on {spec}", flush=True)
 
-    peer = None
+    peer_device = None
     if with_peer:
-        # A second controller on the same link, with no HCI host attached. It
-        # exists purely so there is something in the simulated environment for
-        # the Windows stack to find.
-        peer = WindowsCompatController("peer", link=link, public_address=peer_address)
-        print("peer controller attached to the link", flush=True)
+        # A second controller on the same LocalLink, which is Bumble's simulated
+        # RF medium - the same arrangement Bleak's VHCI integration tests use.
+        #
+        # A bare Controller is not enough: with no host attached it never
+        # advertises, so there is nothing for Windows to discover. It needs a
+        # Device driving it.
+        peer_controller = WindowsCompatController(
+            "peer", link=link, public_address=peer_address
+        )
+        peer_device = Device(
+            name=peer_name,
+            address=hci.Address(peer_address, hci.Address.PUBLIC_DEVICE_ADDRESS),
+            host=Host(peer_controller, peer_controller),
+        )
+        await peer_device.power_on()
+        # auto_restart, because a connection stops advertising and we want the
+        # peer to become discoverable again afterwards.
+        await peer_device.start_advertising(auto_restart=True)
+        print(
+            f"peer '{peer_name}' at {peer_address} advertising on the link",
+            flush=True,
+        )
 
     async with await open_transport(spec) as transport:
         source, sink = transport.source, transport.sink
@@ -196,6 +216,11 @@ def main() -> int:
         help="public BD_ADDR for the discoverable peer, with --peer",
     )
     parser.add_argument(
+        "--peer-name",
+        default="BumblePeer",
+        help="advertised name for the discoverable peer, with --peer",
+    )
+    parser.add_argument(
         "--dual-mode",
         action="store_true",
         help="clear BR_EDR_NOT_SUPPORTED, so the controller claims BR/EDR as well as LE",
@@ -216,6 +241,7 @@ def main() -> int:
                 args.peer,
                 args.address,
                 args.peer_address,
+                args.peer_name,
                 args.dual_mode,
             )
         )
