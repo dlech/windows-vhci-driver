@@ -169,6 +169,33 @@ fact, and it is how the `ScoSupport` question was settled cheaply.
 Note that `WdfDeviceOpenRegistryKey(PLUGPLAY_REGKEY_DEVICE)` wrote nothing here, even from
 `EvtDeviceAdd`. The code uses an absolute path — `\Registry\Machine\SOFTWARE\winvhci` — instead.
 
+### Driver Verifier
+
+```powershell
+verifier /standard /driver winvhci.sys   # then reboot
+verifier /query                          # pool stats, per-module
+verifier /reset                          # then reboot
+```
+
+`/standard` here means special pool, force IRQL checking, pool tracking, I/O verification,
+deadlock detection, DMA checking, security checks, miscellaneous checks and DDI compliance.
+
+**Verifier changes behaviour, so run a control before believing a failure is yours.** Its first
+run here stopped the radio from starting at all, and the useful step was not reading the trace
+harder but re-running the *same binary* with Verifier off — which worked, and immediately
+partitioned the problem. (It was a real defect: see design.md on taking both METHOD_NEITHER
+pointers from the IRP stack location.)
+
+`tools/abuse-teardown.ps1` drives the teardown races: repeated rounds of killing the client
+outright while the stack is driving the transport, one round that kills it with ACL traffic in
+flight mid-GATT, and a device restart under a live client.
+
+**Allow ~10 seconds for a radio to disappear.** The driver's own teardown is immediate —
+`EvtFileClose` and `all radios removed` are microseconds apart — but `Get-PnpDevice` keeps
+reporting the radio for a consistent ~8.4 s afterwards while Windows removes the device stack
+above it, including BthPort's enumerator and RFCOMM children. A shorter check reports a stale
+radio that is not stale.
+
 ### Kernel debugger
 
 Unconfirmed. QEMU's `virt` machine *does* publish an ACPI DBG2 table (unlike VirtualBox), so a

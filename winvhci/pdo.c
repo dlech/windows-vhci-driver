@@ -310,6 +310,16 @@ Routine Description:
 {
     WDFCHILDLIST list = WdfFdoGetDefaultChildList(Fdo);
 
+    //
+    // This function is in a paged segment, so it must not run above
+    // PASSIVE_LEVEL. Its one caller is EvtFileClose, which qualifies - but it
+    // reaches here just after releasing the FDO spinlock, and moving the call
+    // inside that lock would be an easy and silent mistake. PAGED_CODE turns
+    // that into an immediate assertion on a checked build rather than a page
+    // fault at raised IRQL later.
+    //
+    PAGED_CODE();
+
     WdfChildListBeginScan(list);
     //
     // A scan that reports nothing present marks everything previously reported

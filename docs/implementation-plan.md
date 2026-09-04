@@ -134,21 +134,40 @@ simulated link, and raw-byte Command Complete replies. All are in
   guest. `FindAllAsync` already demonstrates discovery, so this is a second opinion rather than
   a gap in the evidence.
 
-### ⬜ M4 — Make it survivable
+### 🟡 M4 — Make it survivable
 
-Nothing here has been done.
+**Done:**
 
-- Driver Verifier (standard + force IRQL checking + low resources) across a full M3 run.
-- Code Analysis and Static Driver Verifier clean.
-- Cancellation and teardown races: kill the userspace process mid-transfer, disable the device
-  mid-transfer, sleep/resume, Airplane mode. The serialhcibus sample carries
-  `GUID_DEVINTERFACE_BLUETOOTH_RADIO_ONOFF_VENDOR_SPECIFIC` handling for the last of these —
-  add it only if the toggle actually misbehaves.
+- **Code Analysis clean.** Two warnings, both fixed: `WinVhciReadUlong` needed
+  `_Success_(return != FALSE)` because it leaves `*Value` untouched on failure (callers seed
+  defaults), and `WinVhciRemoveRadios` is in a paged segment and needed `PAGED_CODE()` — its
+  one caller reaches it just after releasing the FDO spinlock, where moving the call inside
+  the lock would be a silent mistake.
+- **Driver Verifier `/standard`, clean.** It found a real defect on its first run: the
+  dispatcher mixed its buffer sources, taking the input pointer from WDF's captured parameters
+  and the output from the raw IRP. Under Verifier the captured `Type3InputBuffer` is NULL, so
+  `SET_VERSION` failed and the radio never started. Both now come from the IRP's current stack
+  location. See [design.md](design.md).
+- **A full GATT session passes under Verifier**, with 322 pool allocations, none failed and
+  **none leaked** across the whole suite.
+- **Teardown races** (`tools/abuse-teardown.ps1`): repeated abrupt client kills during
+  initialisation, a kill with ACL traffic in flight mid-GATT, and a device restart under a live
+  client. No bugcheck, no stale radios, no leaked pool.
+
+**Still to do:**
+
+- Randomized and systematic **low-resources simulation** — Verifier's fault injection. Not yet
+  run; the driver's allocation failure paths are therefore untested.
+- **Static Driver Verifier**, which is separate from Code Analysis and has not been run.
+- **Sleep/resume and Airplane mode.** The serialhcibus sample carries
+  `GUID_DEVINTERFACE_BLUETOOTH_RADIO_ONOFF_VENDOR_SPECIFIC` handling for the toggle — add it
+  only if the toggle actually misbehaves.
 - Tighten the `\\.\WinVhci` DACL to Administrators + SYSTEM.
 - Decide what to do with the registry breadcrumbs: the `WvScoSupport` / `WvMaxScoChannels` knobs
   earn their keep, the per-IOCTL trace writes are now redundant with DebugView.
 
-**Exit:** an M3 session survives Verifier and the abuse list without a bugcheck.
+**Exit:** an M3 session survives Verifier and the abuse list without a bugcheck. *Met for
+`/standard`; not yet for low-resources simulation.*
 
 ### ⬜ M5 — Ergonomics
 

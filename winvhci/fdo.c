@@ -96,6 +96,7 @@ WinVhciTraceUlong(
     WdfRegistryClose(key);
 }
 
+_Success_(return != FALSE)
 static BOOLEAN
 WinVhciReadUlong(
     _In_  WDFDEVICE Device,
@@ -112,7 +113,9 @@ Routine Description:
 
 Return Value:
 
-    TRUE if the value was present, in which case *Value holds it.
+    TRUE if the value was present, in which case *Value holds it. On FALSE
+    *Value is untouched, which is why callers seed it with the default they
+    want first - hence _Success_(return != FALSE) rather than a plain _Out_.
 
 --*/
 {
@@ -200,26 +203,31 @@ Routine Description:
 
 --*/
 {
-    WDF_REQUEST_PARAMETERS       params;
     PIRP                         irp;
+    PIO_STACK_LOCATION           stack;
     PBTHX_HCI_READ_WRITE_CONTEXT out;
     ULONG                        capacity;
 
-    WDF_REQUEST_PARAMETERS_INIT(&params);
-    WdfRequestGetParameters(Request, &params);
+    //
+    // Buffer and length both from the IRP's current stack location - see the
+    // note in WinVhciBthxDispatch about why mixing that with WDF's captured
+    // parameters breaks under Driver Verifier.
+    //
+    irp   = WdfRequestWdmGetIrp(Request);
+    stack = IoGetCurrentIrpStackLocation(irp);
+    out   = (PBTHX_HCI_READ_WRITE_CONTEXT)irp->UserBuffer;
 
-    irp = WdfRequestWdmGetIrp(Request);
-    out = (PBTHX_HCI_READ_WRITE_CONTEXT)irp->UserBuffer;
-
+    // FIELD_OFFSET is signed, and the stack location's length is a ULONG, so
+    // the comparison needs the cast to stay unsigned.
     if (out == NULL ||
-        params.Parameters.DeviceIoControl.OutputBufferLength <
-            WINVHCI_HCI_CONTEXT_HEADER_SIZE) {
+        stack->Parameters.DeviceIoControl.OutputBufferLength <
+            (ULONG)WINVHCI_HCI_CONTEXT_HEADER_SIZE) {
         WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
     }
 
-    capacity = (ULONG)params.Parameters.DeviceIoControl.OutputBufferLength -
-               WINVHCI_HCI_CONTEXT_HEADER_SIZE;
+    capacity = stack->Parameters.DeviceIoControl.OutputBufferLength -
+               (ULONG)WINVHCI_HCI_CONTEXT_HEADER_SIZE;
     if (capacity < Length) {
         KdPrint(("winvhci: packet too big for read buffer (%u > %u)\n", Length, capacity));
         WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL);
@@ -342,6 +350,7 @@ WinVhciBthxDispatch(
     PWINVHCI_FDO_CONTEXT   ctx    = WinVhciFdoGetContext(device);
     WDF_REQUEST_PARAMETERS params;
     PIRP                   irp;
+    PIO_STACK_LOCATION     stack;
     PVOID                  inBuf;
     PVOID                  outBuf;
     NTSTATUS               status = STATUS_INVALID_DEVICE_REQUEST;
@@ -351,7 +360,33 @@ WinVhciBthxDispatch(
     WdfRequestGetParameters(Request, &params);
 
     irp    = WdfRequestWdmGetIrp(Request);
-    inBuf  = params.Parameters.DeviceIoControl.Type3InputBuffer;
+    stack  = IoGetCurrentIrpStackLocation(irp);
+
+    //
+    // BOTH buffers come from the SAME place: the IRP's current stack location.
+    //
+    // This function used to mix its sources - the input pointer from WDF's
+    // captured WDF_REQUEST_PARAMETERS, the output pointer from the raw IRP.
+    // The two agree in ordinary operation, so it worked for three milestones.
+    // They stop agreeing under Driver Verifier: Type3InputBuffer in the
+    // captured parameters comes back NULL while irp->UserBuffer is still
+    // correct, so SET_VERSION failed STATUS_INVALID_PARAMETER and the radio
+    // never started at all.
+    //
+    // For a METHOD_NEITHER IOCTL the stack location is the authoritative
+    // source for both pointers, and it is already what the read path uses for
+    // its output buffer. The lengths still come from the queue callback's own
+    // arguments, which are part of the documented WDF contract.
+    //
+    if (params.Parameters.DeviceIoControl.Type3InputBuffer !=
+        stack->Parameters.DeviceIoControl.Type3InputBuffer) {
+        KdPrint(("winvhci: Type3InputBuffer differs: wdf %p irp %p (ioctl 0x%08x)\n",
+                 params.Parameters.DeviceIoControl.Type3InputBuffer,
+                 stack->Parameters.DeviceIoControl.Type3InputBuffer,
+                 IoControlCode));
+    }
+
+    inBuf  = stack->Parameters.DeviceIoControl.Type3InputBuffer;
     outBuf = irp->UserBuffer;
 
     //

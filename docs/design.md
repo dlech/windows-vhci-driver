@@ -109,6 +109,20 @@ originate in kernel mode from `BthMini.sys`, so the pointers are kernel addresse
 context — but they must still be retrieved the METHOD_NEITHER way rather than through WDF's
 buffered-request accessors.
 
+**Take both pointers from the same place: the IRP's current stack location.** This is not
+stylistic. The driver originally read the input pointer from WDF's captured
+`WDF_REQUEST_PARAMETERS` and the output pointer from the raw IRP. Those agree in ordinary
+operation — it worked for three milestones — but they stop agreeing under Driver Verifier:
+
+```
+winvhci: Type3InputBuffer differs: wdf 0000000000000000 irp FFFFB40C22235120 (ioctl 0x00410407)
+```
+
+WDF's captured `Type3InputBuffer` comes back NULL while `irp->UserBuffer` stays correct, on
+*every* METHOD_NEITHER input rather than one IOCTL. With the old code `SET_VERSION` failed
+`STATUS_INVALID_PARAMETER` and the radio never started at all. The lengths still come from the
+queue callback's own arguments, which are part of the documented WDF contract.
+
 `bthxddi.h` also supplies the version constant and a ready-made global to answer
 `IOCTL_BTHX_GET_VERSION` with:
 
