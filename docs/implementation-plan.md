@@ -295,6 +295,60 @@ Minimum driver that makes Windows believe there is a radio.
 on it, and WinDbg shows `WRITE_HCI` arriving carrying HCI_Reset (`0x0C03`). This is the
 go/no-go for the entire approach, and it settles research open questions 1 and 3.
 
+#### ✅ Achieved
+
+The seam works. Windows binds the in-box stack to a software-only PDO with no hardware
+anywhere:
+
+```
+Device winvhci\radio\1&79f5d87&4&1 was configured.
+  Driver Name:        bth.inf
+  Class GUID:         {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}   (Bluetooth)
+  Driver Section:     BthMini.NT
+  Matching Device ID: MS_BTHX_BTHMINI
+  Parent Device:      ROOT\SYSTEM\0001
+```
+
+and once the radio starts, the stack immediately drives the transport:
+
+```
+winvhci: WRITE_HCI type 0x01 len 3 (#1)
+winvhci:   command opcode 0x0c03 (OGF 0x03 OCF 0x003) plen 0   <-- HCI_Reset
+```
+
+`MS_BTHX_BTHMINI` is confirmed as the binding point, the BTHX IOCTLs do arrive as
+`IRP_MJ_INTERNAL_DEVICE_CONTROL`, and `WdfRequestForwardToParentDeviceIoQueue` carries them
+from the radio stack to the FDO correctly.
+
+The radio then sits at `CM_PROB_FAILED_POST_START`, which is the *correct* M1 outcome: the
+driver swallows the command and never returns an event, so the stack times out waiting for
+`HCI_Reset`'s Command Complete. Answering it is M2/M3.
+
+Note that no `READ_HCI` was ever posted. The stack issues `WRITE_HCI` first and only pends
+reads once the transport looks alive, so the two-queue read model in 3.3 stays untested until
+M2 - do not assume it is right merely because M1 passed.
+
+#### Diagnosis on this guest
+
+`KdPrint` output is only visible through the **DebugView GUI** (`Dbgview64a.exe`, elevated,
+Capture > Capture Kernel), which works reliably.
+
+`dbgviewcli64a.exe` (v5.02, ARM64) does **not** work - do not spend time on it again. It
+accepts `--accepteula -k`, prints its banner, reports itself as running, and captures nothing
+whatsoever: an empty log, not even other drivers' output. This is not the missing `Dbgv.sys`
+helper driver; it still captures nothing after a GUI session has installed `Dbgv.sys` into
+`System32\Drivers`, and it behaves identically with a real console, with `-l`, and with stdout
+redirection.
+
+The consequence is that live kernel logs require an interactive session, so anything that must
+be readable over SSH is written as a registry breadcrumb under `HKLM\SOFTWARE\winvhci`
+instead. The two are complementary: breadcrumbs answer "how far did we get" unattended, the
+GUI answers "what exactly happened" when a human is watching.
+
+Worth revisiting: QEMU's `virt` machine *does* publish an ACPI DBG2 table, so a live kernel
+debugger over `-serial pipe:` should be possible here (it was not on VirtualBox). That would
+supersede both mechanisms.
+
 ### M2 — The data path
 
 - Device interface + `ReadFile`/`WriteFile` per §3.4, exclusive open, file-object lifetime.
