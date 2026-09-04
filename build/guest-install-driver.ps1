@@ -55,10 +55,28 @@ $inf = Join-Path $Staging 'winvhci.inf'
 
 Write-Host '== Removing any previous instance ==' -ForegroundColor Cyan
 & "$Staging\devcon.exe" remove "root\winvhci" 2>&1 | Out-Null
-# Drop older copies of our package from the driver store so we do not accumulate oem*.inf
-pnputil /enum-drivers | Select-String -Context 0,6 'winvhci.inf' | ForEach-Object {
-    if ($_.Context.PostContext -join "`n" -match 'Published Name:\s+(oem\d+\.inf)') { $Matches[1] }
-    elseif ($_.Line -match '(oem\d+\.inf)') { $Matches[1] }
+
+# Purge every existing winvhci package from the driver store.
+#
+# This is NOT just tidiness. pnputil identifies a package by its INF version,
+# not its contents: re-adding a package whose DriverVer has not changed prints
+# "Driver package already imported" and KEEPS THE OLD BINARY, so the machine
+# keeps running the previous build while you read the new source. That cost
+# several confusing debugging cycles, with breadcrumbs that could not possibly
+# appear because the code writing them was never installed.
+#
+# The earlier version of this loop parsed `pnputil /enum-drivers` with
+# -Context 0,6, looking for "Published Name" AFTER "Original Name". pnputil
+# prints Published Name FIRST, so the match never fired and nothing was ever
+# deleted. Parse it as records instead.
+$published = $null
+pnputil /enum-drivers | ForEach-Object {
+    if ($_ -match '^\s*Published Name:\s*(oem\d+\.inf)') {
+        $published = $Matches[1]
+    } elseif ($_ -match '^\s*Original Name:\s*winvhci\.inf' -and $published) {
+        $published
+        $published = $null
+    }
 } | Sort-Object -Unique | ForEach-Object {
     Write-Host "  removing driver store entry $_"
     pnputil /delete-driver $_ /uninstall /force 2>&1 | Out-Null

@@ -52,11 +52,21 @@
       <TreatWarningAsError>true</TreatWarningAsError>
     </ClCompile>
     <Inf>
-      <TimeStamp>1.0</TimeStamp>
+      <!-- '*' makes stampinf derive the version from the build time, so every
+           build produces a distinct DriverVer. Without that, pnputil sees an
+           unchanged version, reports "Driver package already imported", and
+           keeps serving the PREVIOUS binary out of the driver store - the
+           machine then runs stale code that no longer matches the source. -->
+      <TimeStamp>*</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="driver.c" />
+    <ClCompile Include="fdo.c" />
+    <ClCompile Include="pdo.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="winvhci.h" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="winvhci.inx" />

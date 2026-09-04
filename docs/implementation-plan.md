@@ -189,18 +189,27 @@ Answer `IOCTL_BTHX_QUERY_CAPABILITIES` with:
 
 ```c
 MaxAclTransferInSize = 1021;
-ScoSupport           = ScoSupportNone;   // ← the value to test first
-MaxScoChannels       = 0;
+ScoSupport           = ScoSupportHCIBypass;   // ScoSupportNone is rejected - see below
+MaxScoChannels       = 1;
 IsDeviceIdleCapable  = FALSE;
 IsDeviceWakeCapable  = FALSE;
 ```
 
-Docs say a transport "must specify `ScoSupportHCIBypass`". `ScoSupportNone` is the honest
-value for us and is in the enum. If BthPort rejects it, fall back to claiming
-`ScoSupportHCIBypass` with `MaxScoChannels = 1` and never delivering sideband audio. Make this
-a registry-overridable knob so it's a reboot, not a rebuild.
+**Settled by experiment (M1).** `ScoSupportNone` is *rejected*. Reporting it makes BthMini
+complete the `GET_VERSION` / `SET_VERSION` / `QUERY_CAPABILITIES` handshake and then refuse to
+start the radio with `CM_PROB_FAILED_START` and `STATUS_DEVICE_CONFIGURATION_ERROR`, retrying
+the handshake about six times before giving up. Reporting `ScoSupportHCIBypass` with
+`MaxScoChannels = 1` makes the radio start, after which the stack immediately begins driving
+the transport with `IOCTL_BTHX_WRITE_HCI`.
 
-Idle/wake are `FALSE` initially — deliberately opting out of power management until the data
+So the documentation's "must specify `ScoSupportHCIBypass`" is real and enforced. The driver
+claims it and never delivers sideband audio.
+
+Both values remain registry knobs under `HKLM\SOFTWARE\winvhci` (`WvScoSupport`,
+`WvMaxScoChannels`), which is what made this cheap to establish - a registry edit and a device
+restart rather than a rebuild-sign-package-install cycle.
+
+Idle/wake are `FALSE` initially - deliberately opting out of power management until the data
 path works.
 
 ---

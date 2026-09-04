@@ -42,8 +42,18 @@ foreach ($s in 'guest-setup.ps1','guest-install-driver.ps1','guest-dbg2.ps1') {
     Copy-Item (Join-Path $RepoRoot "build\$s") $ShareDir -Force
 }
 Copy-Item (Join-Path $RepoRoot 'build\tools\devcon.exe') (Join-Path $ShareDir 'tools') -Force
-$dbgv = Join-Path $RepoRoot 'build\tools\DebugView\Dbgview64a.exe'
-if (Test-Path $dbgv) { Copy-Item $dbgv (Join-Path $ShareDir 'tools') -Force }
+
+# DebugView, ARM64 builds. Both matter:
+#   Dbgview64a.exe    - the GUI, for watching live at the guest console.
+#   dbgviewcli64a.exe - the console version, which is the one that works over
+#                       SSH: it captures kernel DbgPrint output to a file with
+#                       no interactive session, so driver logs can be collected
+#                       and read back from the host.
+foreach ($t in 'Dbgview64a.exe', 'dbgviewcli64a.exe') {
+    $p = Join-Path $RepoRoot "build\tools\DebugView\$t"
+    if (Test-Path $p) { Copy-Item $p (Join-Path $ShareDir 'tools') -Force }
+    else { Write-Warning "missing $t - see build\tools\README.md" }
+}
 
 # ---- author the ISO ----------------------------------------------------------
 # IMAPI2 hands back an IStream; this tiny helper pumps it to disk.
