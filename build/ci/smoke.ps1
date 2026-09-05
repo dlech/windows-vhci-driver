@@ -485,17 +485,14 @@ pnputil /enum-drivers | ForEach-Object {
 Check 'nothing winvhci remains' { -not (Get-Fdo) -and -not (Get-Radio) }
 
 if ($Verifier) {
-    # Counterparts to what was actually used: the driver was enrolled with
-    # /volatile /adddriver and the flags set with /volatile /flags, so both come
-    # back off the same way. (/stop is for rule classes enabled via '/dif /now',
-    # which is not the mechanism that worked here.)
-    #
-    # Nothing here reboots, so leaving verification armed for a driver that has
-    # just been uninstalled would be a trap for whatever runs next.
-    # Nothing was armed, so nothing is disarmed - see the Driver Verifier state
-    # section. This only unenrols in case the script is being run on a machine
-    # where a previous run, or a person, left the driver enrolled; on a runner
-    # it is a no-op and the error is ignored.
+    # Nothing was armed here, so on a runner this is a no-op and says so
+    # ("The request is not supported"), which is expected noise rather than a
+    # problem - see the Driver Verifier state section for why arming is not
+    # possible. It runs anyway because this script is meant to be run on a
+    # developer guest too, where a previous run or a person may have left the
+    # driver enrolled: nothing below reboots, so leaving verification armed for
+    # a driver that has just been uninstalled would be a trap for whatever runs
+    # next.
     verifier /volatile /removedriver winvhci.sys 2>&1 | ForEach-Object { Write-Host "  $_" }
 }
 

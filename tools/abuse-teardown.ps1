@@ -199,3 +199,7 @@ if ($failures -gt 0) {
     exit 1
 }
 Write-Host 'RESULT: no bugcheck, no stale radios' -ForegroundColor Green
+# Explicit, because without it the caller sees $LASTEXITCODE from whatever
+# native command ran last - which is pnputil /restart-device, and that
+# legitimately returns 3010. A passing run reported itself as failing.
+exit 0
