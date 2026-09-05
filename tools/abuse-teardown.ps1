@@ -19,6 +19,8 @@
 param(
     [int]$Rounds     = 5,
     [string]$Bridge  = 'C:\tools\vhcibridge.ps1',
+    # The self-contained client, used for the device-restart round below.
+    [string]$Ctl     = 'C:\tools\vhcictl.ps1',
     [string]$RemoteHost = '10.0.2.2',
     [int]$Port       = 6402,
     [int]$SettleSec  = 20,
@@ -62,8 +64,12 @@ for ($i = 1; $i -le $Rounds; $i++) {
         if ($radio -and $radio.Status -eq 'OK') { break }
     }
 
+    # A round with no radio has abused nothing - there was no PDO to tear down
+    # and no pended BTHX read to complete - so it is a failure, not a warning.
+    # As a warning it hid exactly that: the round looked like it had run.
     if (-not $radio) {
-        Write-Host '  radio never appeared' -ForegroundColor Yellow
+        Write-Host '  FAIL: radio never appeared, so this round abused nothing' -ForegroundColor Red
+        $failures++
     } else {
         Write-Host "  radio: $($radio.Status)"
     }
@@ -129,22 +135,63 @@ if (Test-Path 'C:\tools\win-ble-connect.ps1') {
 
 Write-Host ''
 Write-Host '=== device restart with a client attached ===' -ForegroundColor Cyan
+#
+# Driven by vhcictl, not the bridge. What this round needs is a client holding
+# \\.\WinVhci with a radio created; the controller is beside the point, and
+# vhcictl answers the stack itself. Depending on the controller is what broke
+# this round the first time it ran in CI: the tier shares one Bumble instance
+# across every round, Bumble dropped the fourth connection, the bridge exited
+# before the restart, and the round asserted nothing while still printing
+# "survived a device restart under a live client".
+#
+# That is also why the radio is now checked BEFORE the restart rather than
+# assumed after a fixed sleep.
+$ctlSec = $SettleSec + $TeardownSec + 30
 $p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
-    '-ExecutionPolicy','Bypass','-File',$Bridge,
-    '-RemoteHost',$RemoteHost,'-Port',$Port
+    '-ExecutionPolicy','Bypass','-File',$Ctl,'-Seconds',$ctlSec
 ) -RedirectStandardOutput 'C:\abuse-dis.log' -RedirectStandardError 'C:\abuse-dis.err'
-Start-Sleep -Seconds $SettleSec
 
-# Pull the FDO out from under a live client: the child PDO and every pended
-# request have to be torn down while userspace still holds the handle.
-if ($Devnode) {
-    & $Devnode -Restart | Out-Null
-} else {
-    & $Devcon restart 'root\winvhci' | Out-Null
+$deadline = (Get-Date).AddSeconds($SettleSec)
+$radio = $null
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 800
+    $radio = Get-Radio
+    if ($radio -and $radio.Status -eq 'OK') { break }
 }
-Start-Sleep -Seconds 6
+
+if (-not ($radio -and $radio.Status -eq 'OK')) {
+    Write-Host '  FAIL: no radio was attached, so nothing was pulled out from under a client' -ForegroundColor Red
+    $failures++
+} else {
+    # Pull the FDO out from under a live client: the child PDO and every pended
+    # request have to be torn down while userspace still holds the handle.
+    if ($Devnode) {
+        & $Devnode -Restart | Out-Null
+    } else {
+        & $Devcon restart 'root\winvhci' | Out-Null
+    }
+
+    # The FDO is root-enumerated, so it comes back by itself. Assert that it
+    # did: surviving the restart means the device is present and started
+    # afterwards, not merely that the machine is still answering.
+    $fdo = $null
+    $deadline = (Get-Date).AddSeconds($TeardownSec)
+    do {
+        Start-Sleep -Milliseconds 500
+        $fdo = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+               Where-Object { $_.InstanceId -like 'ROOT\SYSTEM\*' -and $_.Service -eq 'winvhci' } |
+               Select-Object -First 1
+    } while (-not ($fdo -and $fdo.Status -eq 'OK') -and (Get-Date) -lt $deadline)
+
+    if ($fdo -and $fdo.Status -eq 'OK') {
+        Write-Host '  survived a device restart under a live client' -ForegroundColor Green
+    } else {
+        Write-Host "  FAIL: FDO did not come back started after the restart: $($fdo.Status)" -ForegroundColor Red
+        $failures++
+    }
+}
+
 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-Write-Host '  survived a device restart under a live client' -ForegroundColor Green
 
 Write-Host ''
 if ($failures -gt 0) {
