@@ -1,0 +1,39 @@
+<Project>
+  <!--
+    Point the build at the NuGet WDK when it has been restored, and do nothing
+    at all when it has not.
+
+    Every import below is guarded on the file existing, so a developer machine
+    with the WDK installed is completely unaffected: `packages\` does not exist
+    there, no import fires, and MSBuild resolves the toolchain the way it always
+    did. In CI `nuget restore` creates it and these take over.
+
+    The guards are also why a version mistake here is dangerous. The WDK's own
+    toolset imports are Exists()-guarded too, so if WDKContentRoot and
+    WindowsTargetPlatformVersion disagree nothing errors - you get a project
+    with no driver targets, no km include paths, and a failure much later that
+    reads like a missing ntddk.h. build\ci\build-package.ps1 asserts the two
+    paths that matter before invoking MSBuild, so that mistake fails as itself.
+  -->
+  <PropertyGroup>
+    <WdkNuGetVersion Condition="'$(WdkNuGetVersion)' == ''">10.0.28000.2526</WdkNuGetVersion>
+    <WdkPkgDir>$(MSBuildThisFileDirectory)packages\</WdkPkgDir>
+  </PropertyGroup>
+
+  <ImportGroup Condition="'$(Platform)' == 'x64'">
+    <Import Project="$(WdkPkgDir)Microsoft.Windows.SDK.CPP.x64.$(WdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.x64.props"
+            Condition="Exists('$(WdkPkgDir)Microsoft.Windows.SDK.CPP.x64.$(WdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.x64.props')" />
+    <Import Project="$(WdkPkgDir)Microsoft.Windows.WDK.x64.$(WdkNuGetVersion)\build\native\Microsoft.Windows.WDK.x64.props"
+            Condition="Exists('$(WdkPkgDir)Microsoft.Windows.WDK.x64.$(WdkNuGetVersion)\build\native\Microsoft.Windows.WDK.x64.props')" />
+  </ImportGroup>
+
+  <ImportGroup Condition="'$(Platform)' == 'ARM64'">
+    <Import Project="$(WdkPkgDir)Microsoft.Windows.SDK.CPP.arm64.$(WdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.arm64.props"
+            Condition="Exists('$(WdkPkgDir)Microsoft.Windows.SDK.CPP.arm64.$(WdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.arm64.props')" />
+    <Import Project="$(WdkPkgDir)Microsoft.Windows.WDK.arm64.$(WdkNuGetVersion)\build\native\Microsoft.Windows.WDK.arm64.props"
+            Condition="Exists('$(WdkPkgDir)Microsoft.Windows.WDK.arm64.$(WdkNuGetVersion)\build\native\Microsoft.Windows.WDK.arm64.props')" />
+  </ImportGroup>
+
+  <Import Project="$(WdkPkgDir)Microsoft.Windows.SDK.CPP.$(WdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.props"
+          Condition="Exists('$(WdkPkgDir)Microsoft.Windows.SDK.CPP.$(WdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.props')" />
+</Project>

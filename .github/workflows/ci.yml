@@ -1,0 +1,130 @@
+# Build winvhci, then install it on a runner and prove the Windows Bluetooth
+# stack binds to it.
+#
+# No VM is involved. GitHub's Windows runner images run
+# `bcdedit.exe /set TESTSIGNING ON` at image build time and assert it in an
+# image validation test, so a self-signed test-signed driver loads directly on a
+# runner. build\ci\probe-runner.ps1 confirmed that on all four images, along
+# with the more surprising half: bth.inf, with MS_BTHX_BTHMINI and an NTamd64
+# section, is present on the Windows Server images too - so x64 can be
+# load-tested on a free runner just as ARM64 can.
+#
+# Runner choices:
+#   windows-2025            x64 smoke. Server 2025, but it has the full
+#                           Bluetooth stack and Radio access is Allowed.
+#   windows-11-vs2026-arm   ARM64 smoke. Windows 11 client; the image
+#                           consumers of the eventual action would use.
+#   windows-2022            deliberately NOT used for smoke: RequestAccessAsync
+#                           returns DeniedByUser and the user-mode Bluetooth
+#                           services are absent.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  WDK_VERSION: 10.0.28000.2526
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }} ${{ matrix.configuration }}
+    # windows-2025, windows-2025-vs2026 and windows-latest are currently the
+    # same image. Pin an explicit label so a future -latest migration cannot
+    # silently change the toolchain.
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, ARM64]
+        configuration: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore the WDK from NuGet
+        shell: pwsh
+        run: nuget restore .\packages.config -PackagesDirectory .\packages -NonInteractive
+
+      - name: Build, sign and stage
+        shell: pwsh
+        run: |
+          .\build\ci\build-package.ps1 `
+            -Platform ${{ matrix.platform }} `
+            -Configuration ${{ matrix.configuration }} `
+            -WdkVersion $env:WDK_VERSION `
+            -OutDir out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winvhci-${{ matrix.platform }}-${{ matrix.configuration }}
+          path: out/
+          if-no-files-found: error
+
+      # The binlog is the only practical way to see which of the WDK's
+      # Exists()-guarded imports actually resolved, which is the failure mode
+      # most likely to bite when the toolchain moves.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: buildlog-${{ matrix.platform }}-${{ matrix.configuration }}
+          path: artifacts/logs/
+          if-no-files-found: ignore
+
+  smoke:
+    name: smoke ${{ matrix.platform }} on ${{ matrix.runner }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ARM64
+            runner: windows-11-vs2026-arm
+          - platform: x64
+            runner: windows-2025
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Debug, not Release: KdPrint is #if DBG, so a Release load failure would
+      # be silent just when the output is most needed.
+      - uses: actions/download-artifact@v4
+        with:
+          name: winvhci-${{ matrix.platform }}-Debug
+          path: pkg
+
+      - name: Install and assert
+        # Windows PowerShell 5.1, not pwsh: tools\vhci-io.ps1 and the WinRT
+        # paths this leads to are written for it, and PowerShell 7 dropped the
+        # WindowsRuntime type accelerator.
+        shell: powershell
+        run: |
+          .\build\ci\smoke.ps1 -PackageDir pkg -Json smoke-${{ matrix.platform }}.json
+
+      - name: Collect diagnostics
+        if: always()
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path diag -Force | Out-Null
+          Copy-Item "$env:windir\INF\setupapi.dev.log" diag\ -ErrorAction SilentlyContinue
+          bcdedit /enum '{current}'          > diag\bcdedit.txt        2>&1
+          pnputil /enum-drivers              > diag\enum-drivers.txt   2>&1
+          pnputil /enum-devices /problem     > diag\problem-devices.txt 2>&1
+          Get-PnpDevice | Format-List * | Out-File diag\pnp-all.txt
+          Get-WinEvent -LogName System -MaxEvents 200 -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, Id, ProviderName, Message | Out-File diag\system-events.txt
+          Copy-Item smoke-*.json diag\ -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-diag-${{ matrix.platform }}
+          path: diag/
+          if-no-files-found: warn
