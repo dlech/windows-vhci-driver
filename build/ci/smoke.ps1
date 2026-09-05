@@ -30,10 +30,11 @@ param(
     [switch]$Bumble,
     [string]$Python = 'python',
 
-    # Tier 3: abuse the teardown path - which implementation-plan.md still lists
-    # as the open risk - under what Verifier coverage a job without a reboot can
-    # actually get, which is force-pending-I/O and IRP logging rather than the
-    # standard rule set. See the arming block for why.
+    # Tier 3: abuse the teardown path, which implementation-plan.md still lists
+    # as the open risk. It reports whether Driver Verifier happens to be active
+    # and runs either way - on a hosted runner it cannot be, because arming it
+    # needs a reboot; on a developer guest that has rebooted with /standard set,
+    # the same abuse runs under real verification. See the tier for the evidence.
     [switch]$Verifier,
     [int]   $AbuseRounds = 3,
 
@@ -190,88 +191,49 @@ Check 'FDO reaches Status OK' {
 
 if ($Verifier) {
     Write-Host ''
-    Write-Host '=== Arming Driver Verifier ===' -ForegroundColor Cyan
+    Write-Host '=== Driver Verifier state ===' -ForegroundColor Cyan
 
-    # Not /standard, and not /volatile either.
+    # Driver Verifier cannot be turned on here, and this reports rather than
+    # tries. Every documented route was attempted on both windows-2025 and
+    # windows-11-vs2026-arm, and the evidence is worth keeping because three of
+    # the four look like they work:
     #
-    # /standard needs a reboot, which a CI job cannot do. /volatile looks like
-    # the answer and is what several projects still use, but it is deprecated
-    # and accepts only three flags - low resources simulation, force pending
-    # I/O, IRP logging - so asking it for the standard set is refused outright:
-    # "The specified flags 0x000209bb are not supported in volatile mode."
-    #
-    # The mechanism that does work without rebooting is DIF, dynamic
-    # instrumentation, which Windows itself points at in that error. It takes
-    # rule class numbers rather than a bitmask. These ten are exactly the ones
-    # `verifier /?` marks (^), meaning they can be enabled without a reboot,
-    # and they are the standard set plus the additional DDI compliance class:
-    #
-    #   1 special pool          2 force IRQL checking   4 pool tracking
-    #   5 I/O verification      6 deadlock detection    8 DMA checking
-    #   9 security checks      12 miscellaneous checks 18 DDI compliance
-    #  20 DDI compliance (additional)
-    #
-    # Low resources simulation (class 3) is deliberately absent: development.md
-    # records that it does not reach this driver at all - at 100% probability it
-    # failed none of 24 allocations, because both allocation sites call
-    # ExAllocatePool2 while holding the FDO spinlock at DISPATCH_LEVEL.
-    # WvFailAllocOneIn is what exercises those paths.
-    #
-    # This runs after the driver has loaded, because DIF instruments a running
-    # driver rather than arranging for a future one to be verified.
-    # What is actually achievable here is narrower than /standard, and it is
-    # worth being precise about why, because three other forms look like they
-    # should work and do not.
-    #
-    #   verifier /dif <classes> /now [/driver winvhci.sys]
-    #       Exits 1 and prints nothing, with or without /driver, on both
-    #       windows-2025 and windows-11-vs2026-arm. This is the form the help
-    #       text itself recommends for enabling flags without rebooting.
+    #   verifier /standard /driver winvhci.sys
+    #       The documented local flow. Requires a reboot, which a job cannot do.
     #
     #   verifier /rc <classes> /driver winvhci.sys
-    #       Works - it reports "Verifier Flags: 0x001a09bb" - but exits 2,
-    #       meaning the settings are persistent and need a reboot. A CI job
-    #       cannot reboot, so the flags would never take effect.
+    #       Accepted, reports "Verifier Flags: 0x001a09bb" - and exits 2,
+    #       meaning persistent settings pending a reboot. Never takes effect.
     #
-    #   verifier /volatile /adddriver winvhci.sys
-    #       Exits 0 and makes /query list the driver, which looks like success
-    #       and is not: it reports "Verifier Volatile Flags: 0x00000000". The
-    #       driver is enrolled with no checks enabled at all.
+    #   verifier /dif <classes> /now [/driver winvhci.sys]
+    #       The form the help text recommends for enabling flags without
+    #       rebooting. Exits 1 and prints nothing at all, with or without
+    #       /driver.
     #
-    # So the driver has to be enrolled AND flags set, and only three flags are
-    # permitted in volatile mode. Of those, randomized low resources simulation
-    # (0x4) is already known not to reach this driver - development.md records
-    # it failing none of 24 allocations, because both allocation sites call
-    # ExAllocatePool2 under the FDO spinlock at DISPATCH_LEVEL. That leaves:
+    #   verifier /volatile /adddriver winvhci.sys + /volatile /flags 0x600
+    #       Both exit 0, and /query then lists the driver - which looks like
+    #       success and is not. It reports "Verifier Volatile Flags:
+    #       0x00000000", with every flag unchecked, including the two the help
+    #       says are legal in volatile mode.
     #
-    #   0x200  force pending I/O requests
-    #   0x400  IRP logging
+    # The reading that fits all four: volatile settings modify a Verifier
+    # session that is already running, and on a runner Verifier has never been
+    # active since boot, so there is no session to modify. Which is the same
+    # thing /rc says outright by asking for a reboot.
     #
-    # Force pending I/O is the valuable one for this driver. It makes IRPs that
-    # would have completed synchronously complete later instead, which is
-    # precisely the shape of the read path - and the teardown abuse below is
-    # about what happens to pended reads when their client dies.
-    #
-    # This is NOT the standard rule set, and it should not be described as
-    # such. Special pool, IRQL checking and DDI compliance need a reboot and so
-    # remain a local step, as development.md already describes.
-    $volatileFlags = '0x600'
-
-    verifier /volatile /adddriver winvhci.sys 2>&1 | ForEach-Object { Write-Host "  $_" }
-    verifier /volatile /flags $volatileFlags 2>&1 | ForEach-Object { Write-Host "  $_" }
-
+    # So Verifier stays a local step, exactly as development.md describes it.
+    # What CI can still do is run the abuse below, which is worth having on its
+    # own: it is the teardown race, and a well-behaved session never touches it.
+    # When this script runs on a machine where Verifier IS armed - a developer
+    # guest that has rebooted with /standard set - the same abuse then runs
+    # under real verification, which is the combination that matters.
     $query = verifier /query 2>&1 | Out-String
-
-    # Both halves, deliberately. Enrolment alone passed the previous version of
-    # this check while zero flags were set, which is the exact failure mode the
-    # check exists to catch.
-    Check 'Verifier has winvhci.sys enrolled' { $query -match '(?i)winvhci' } `
-          'verifier /query does not list the driver'
-    Check 'Verifier has non-zero volatile flags' {
-        if ($query -match '(?im)^\s*Verifier Volatile Flags:\s*(0x[0-9a-f]+)') {
-            [Convert]::ToInt64($Matches[1], 16) -ne 0
-        } else { $false }
-    } 'enrolled with no checks enabled is not verification'
+    if ($query -match '(?i)winvhci') {
+        Write-Host '  Verifier is verifying winvhci.sys - the abuse tier will run under it' -ForegroundColor Green
+    } else {
+        Write-Host '  Verifier is not active for winvhci.sys on this machine.' -ForegroundColor Yellow
+        Write-Host '  Expected on a hosted runner: arming it needs a reboot. Not a failure.' -ForegroundColor DarkGray
+    }
 }
 
 Write-Host ''
@@ -447,7 +409,7 @@ if ($Bumble) {
 
 if ($Verifier -and $Bumble) {
     Write-Host ''
-    Write-Host '=== Tier 3: teardown abuse, with pending-I/O forced ===' -ForegroundColor Cyan
+    Write-Host '=== Tier 3: teardown abuse ===' -ForegroundColor Cyan
 
     # A client dying abruptly is the NORMAL case here, not an edge case: the
     # radio's lifetime is a file handle's lifetime. When it dies the driver has
@@ -529,7 +491,10 @@ if ($Verifier) {
     #
     # Nothing here reboots, so leaving verification armed for a driver that has
     # just been uninstalled would be a trap for whatever runs next.
-    verifier /volatile /flags 0x0 2>&1 | ForEach-Object { Write-Host "  $_" }
+    # Nothing was armed, so nothing is disarmed - see the Driver Verifier state
+    # section. This only unenrols in case the script is being run on a machine
+    # where a previous run, or a person, left the driver enrolled; on a runner
+    # it is a no-op and the error is ignored.
     verifier /volatile /removedriver winvhci.sys 2>&1 | ForEach-Object { Write-Host "  $_" }
 }
 
