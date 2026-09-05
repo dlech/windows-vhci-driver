@@ -166,7 +166,8 @@ jobs:
         # WindowsRuntime type accelerator.
         shell: powershell
         run: |
-          .\build\ci\smoke.ps1 -PackageDir pkg -Bumble -Python "${{ steps.py.outputs.python-path }}" `
+          .\build\ci\smoke.ps1 -PackageDir pkg -Bumble -Verifier `
+            -Python "${{ steps.py.outputs.python-path }}" `
             -Json smoke-${{ matrix.platform }}.json
 
       - name: Collect diagnostics
@@ -186,6 +187,10 @@ jobs:
           # initialisation this is where the last command it asked for shows up,
           # which is what identifies the missing handler.
           Copy-Item bumble.*.log diag\ -ErrorAction SilentlyContinue
+          # abuse-teardown.ps1 writes a per-round bridge log to the root of C:.
+          Copy-Item C:\abuse-*.log diag\ -ErrorAction SilentlyContinue
+          Copy-Item C:\abuse-*.err diag\ -ErrorAction SilentlyContinue
+          verifier /query > diag\verifier-query.txt 2>&1
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()

@@ -25,7 +25,13 @@ param(
     # How long the radio is allowed to take to disappear after the client dies.
     # Tearing the node down means unloading BthPort's whole stack above it - the
     # enumerator and RFCOMM nodes too - so this is not instant.
-    [int]$TeardownSec = 20
+    [int]$TeardownSec = 20,
+    # How to restart the device for the final round. Defaults to devcon, which
+    # is what a WDK machine has; CI passes build\ci\vhci-devnode.ps1 instead,
+    # because devcon may not be redistributed and is absent from some runner
+    # images entirely.
+    [string]$Devnode,
+    [string]$Devcon = 'C:\winvhci\devcon.exe'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -131,7 +137,11 @@ Start-Sleep -Seconds $SettleSec
 
 # Pull the FDO out from under a live client: the child PDO and every pended
 # request have to be torn down while userspace still holds the handle.
-& C:\winvhci\devcon.exe restart 'root\winvhci' | Out-Null
+if ($Devnode) {
+    & $Devnode -Restart | Out-Null
+} else {
+    & $Devcon restart 'root\winvhci' | Out-Null
+}
 Start-Sleep -Seconds 6
 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
 Write-Host '  survived a device restart under a live client' -ForegroundColor Green
