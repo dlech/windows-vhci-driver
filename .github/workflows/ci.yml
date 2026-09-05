@@ -49,7 +49,7 @@ jobs:
         configuration: [Debug, Release]
 
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Restoring the WDK dominated the job: 110s of a 152s build. Two changes
       # cut it. The packages are cached across runs, and each leg downloads only
@@ -127,7 +127,7 @@ jobs:
             runner: windows-2025
 
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Debug, not Release: KdPrint is #if DBG, so a Release load failure would
       # be silent just when the output is most needed.
@@ -137,7 +137,7 @@ jobs:
       # to support direct uploads - and this job depends on the artifact
       # arriving as an unpacked tree at pkg\package\. v7 is already on Node 24,
       # so it clears the deprecation without taking that change on.
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: winvhci-${{ matrix.platform }}-Debug
           path: pkg
