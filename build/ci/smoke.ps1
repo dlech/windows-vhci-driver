@@ -144,36 +144,6 @@ foreach ($store in 'Root', 'TrustedPublisher') {
     Write-Host "  added to LocalMachine\$store"
 }
 
-if ($Verifier) {
-    Write-Host ''
-    Write-Host '=== Arming Driver Verifier ===' -ForegroundColor Cyan
-
-    # /volatile, not /standard. The documented local flow is
-    # `verifier /standard /driver winvhci.sys` followed by a reboot, and a CI
-    # job cannot reboot. Volatile settings take effect immediately and apply to
-    # drivers loaded afterwards - which is why this runs BEFORE the devnode is
-    # created and the driver loads.
-    #
-    # 0x209BB is the standard set: special pool, force IRQL checking, pool
-    # tracking, I/O verification, deadlock detection, DMA checking, security
-    # checks, miscellaneous checks and DDI compliance.
-    #
-    # Low resources simulation (0x4) is deliberately absent. It has already been
-    # measured not to reach this driver at all - at probability 100% it failed
-    # none of 24 allocations, because both allocation sites call
-    # ExAllocatePool2 while holding the FDO spinlock at DISPATCH_LEVEL. The
-    # WvFailAllocOneIn registry knob is what exercises those paths.
-    $applied = $null
-    foreach ($mask in '0x209BB', '0x9BB') {
-        verifier /volatile /adddriver winvhci.sys /flags $mask 2>&1 | ForEach-Object { Write-Host "  $_" }
-        if ($LASTEXITCODE -eq 0) { $applied = $mask; break }
-        Write-Host "  flags $mask rejected, trying a smaller set" -ForegroundColor Yellow
-    }
-    Check 'Driver Verifier accepted volatile settings' { $null -ne $applied } `
-          'neither the standard flag set nor the set without DDI compliance applied'
-    if ($applied) { Write-Host "  armed with flags $applied" }
-}
-
 Write-Host ''
 Write-Host '=== Installing ===' -ForegroundColor Cyan
 
@@ -217,13 +187,52 @@ Check 'FDO reaches Status OK' {
 } "status was '$(if ($fdo) { $fdo.Status })', problem '$(if ($fdo) { $fdo.Problem })'"
 
 if ($Verifier) {
-    # Arming Verifier and having it actually verify are different things, and a
-    # silently ineffective Verifier is worse than none: every later check passes
-    # and appears to mean something it does not. /query lists the modules being
-    # verified right now, so it can only say yes once the driver has loaded.
+    Write-Host ''
+    Write-Host '=== Arming Driver Verifier ===' -ForegroundColor Cyan
+
+    # Not /standard, and not /volatile either.
+    #
+    # /standard needs a reboot, which a CI job cannot do. /volatile looks like
+    # the answer and is what several projects still use, but it is deprecated
+    # and accepts only three flags - low resources simulation, force pending
+    # I/O, IRP logging - so asking it for the standard set is refused outright:
+    # "The specified flags 0x000209bb are not supported in volatile mode."
+    #
+    # The mechanism that does work without rebooting is DIF, dynamic
+    # instrumentation, which Windows itself points at in that error. It takes
+    # rule class numbers rather than a bitmask. These ten are exactly the ones
+    # `verifier /?` marks (^), meaning they can be enabled without a reboot,
+    # and they are the standard set plus the additional DDI compliance class:
+    #
+    #   1 special pool          2 force IRQL checking   4 pool tracking
+    #   5 I/O verification      6 deadlock detection    8 DMA checking
+    #   9 security checks      12 miscellaneous checks 18 DDI compliance
+    #  20 DDI compliance (additional)
+    #
+    # Low resources simulation (class 3) is deliberately absent: development.md
+    # records that it does not reach this driver at all - at 100% probability it
+    # failed none of 24 allocations, because both allocation sites call
+    # ExAllocatePool2 while holding the FDO spinlock at DISPATCH_LEVEL.
+    # WvFailAllocOneIn is what exercises those paths.
+    #
+    # This runs after the driver has loaded, because DIF instruments a running
+    # driver rather than arranging for a future one to be verified.
+    $classes = @('1', '2', '4', '5', '6', '8', '9', '12', '18', '20')
+    $armed = $false
+    foreach ($verb in '/dif', '/rc') {
+        verifier $verb @classes '/now' '/driver' 'winvhci.sys' 2>&1 |
+            ForEach-Object { Write-Host "  $_" }
+        if ($LASTEXITCODE -eq 0) { $armed = $true; Write-Host "  armed via $verb"; break }
+        Write-Host "  $verb was refused, trying the next form" -ForegroundColor Yellow
+    }
+    Check 'Driver Verifier accepted the rule classes' { $armed }
+
+    # Arming and verifying are different things, and a silently ineffective
+    # Verifier is worse than none: every later check would pass and appear to
+    # mean something it does not. /query lists what is being verified right now.
     $query = verifier /query 2>&1 | Out-String
-    Check 'Verifier is actually verifying winvhci.sys' { $query -match '(?i)winvhci\.sys' } `
-          'verifier /query does not list the driver, so the flags reached nothing'
+    Check 'Verifier is actually verifying winvhci.sys' { $query -match '(?i)winvhci' } `
+          'verifier /query does not list the driver, so the rule classes reached nothing'
 }
 
 Write-Host ''
@@ -474,10 +483,11 @@ pnputil /enum-drivers | ForEach-Object {
 Check 'nothing winvhci remains' { -not (Get-Fdo) -and -not (Get-Radio) }
 
 if ($Verifier) {
-    # Volatile settings do not survive a reboot, but the runner is not going to
-    # reboot - and leaving verification armed for a driver that has just been
-    # uninstalled is a booby trap for anything that runs after this.
-    verifier /volatile /removedriver winvhci.sys 2>&1 | ForEach-Object { Write-Host "  $_" }
+    # /stop is the counterpart to '/dif ... /now' - it halts the rule classes
+    # enabled that way. Nothing here reboots, so leaving verification armed for
+    # a driver that has just been uninstalled would be a trap for whatever runs
+    # next on this machine.
+    verifier /stop 2>&1 | ForEach-Object { Write-Host "  $_" }
 }
 
 Write-Host ''
