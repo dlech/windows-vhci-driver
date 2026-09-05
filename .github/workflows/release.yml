@@ -227,10 +227,18 @@ jobs:
           thumbprint=$(python3 -c "import json;print(json.load(open('$info'))['certThumbprint'])")
           subject=$(python3 -c "import json;print(json.load(open('$info'))['certSubject'])")
 
+          # What CHANGED. build-info.json can only say what the release IS, so
+          # without this the notes would never mention a single change. Missing
+          # section is a hard failure: publishing a release whose changelog
+          # entry was forgotten costs a re-tag to put right.
+          changes=$(python3 build/ci/changelog-section.py CHANGELOG.md "${GITHUB_REF_NAME}")
+
           cat > notes.md <<NOTES
           A virtual Bluetooth HCI controller for Windows. Userspace supplies the
           controller behaviour; Windows sees a real local Bluetooth radio with
           the whole in-box stack above it.
+
+          ${changes}
 
           **This driver is test-signed.** It will not load on a Windows machine
           in its default configuration. The installer checks each prerequisite
