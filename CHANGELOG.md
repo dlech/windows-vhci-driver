@@ -12,6 +12,8 @@ the supported runner images.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-05
+
 ### Changed
 
 - Backlogs are unbounded and never drop, matching Linux `/dev/vhci`.
