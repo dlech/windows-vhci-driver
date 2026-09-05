@@ -28,8 +28,15 @@ import ctypes
 import functools
 import threading
 from ctypes import wintypes
+from dataclasses import dataclass
 
-__all__ = ['VhciDevice', 'VhciError', 'DEFAULT_DEVICE_PATH', 'MAX_H4_PACKET']
+__all__ = [
+    'VhciDevice',
+    'VhciError',
+    'VhciStats',
+    'DEFAULT_DEVICE_PATH',
+    'MAX_H4_PACKET',
+]
 
 #: Matches ``WINVHCI_MAX_H4_PACKET`` in ``winvhci/winvhci.h``: one type byte,
 #: a four byte ACL header, and ``WINVHCI_MAX_ACL_TRANSFER_IN`` of payload. A
@@ -63,11 +70,124 @@ _READ_POLL_MS = 250
 
 #: Bound on a write. The driver queues a write and completes it, so this only
 #: exists so a wedged device fails rather than hanging a test forever.
+#:
+#: A write can now legitimately take a while: when the controller-to-host
+#: backlog is full the driver pends the write instead of failing it, and
+#: completes it once the Bluetooth stack drains one packet. So this timeout is
+#: the boundary between "backpressure" and "the stack stopped reading".
 _WRITE_TIMEOUT_MS = 5000
+
+
+def _ctl_code(device_type: int, function: int, method: int, access: int) -> int:
+    """Windows' ``CTL_CODE`` macro.
+
+    Spelled out rather than written as a literal because a hand-computed
+    control code was wrong on the first attempt here, and a wrong code fails as
+    ``ERROR_INVALID_FUNCTION`` - which reads as the driver not implementing the
+    IOCTL rather than as the caller asking for the wrong one.
+    """
+    return (device_type << 16) | (access << 14) | (function << 2) | method
+
+
+_FILE_DEVICE_UNKNOWN = 0x22
+_METHOD_BUFFERED = 0
+_FILE_READ_ACCESS = 1
+
+#: ``IOCTL_WINVHCI_GET_STATS`` from ``winvhci/winvhci.h``.
+_IOCTL_WINVHCI_GET_STATS = _ctl_code(
+    _FILE_DEVICE_UNKNOWN, 0x800, _METHOD_BUFFERED, _FILE_READ_ACCESS)
 
 
 class VhciError(Exception):
     """An error from the device or from the Win32 calls behind it."""
+
+
+class _WINVHCI_STATS(ctypes.Structure):
+    """Mirrors ``WINVHCI_STATS`` in ``winvhci/winvhci.h``.
+
+    ``Size`` is the driver's own ``sizeof``, so a mismatch between this
+    declaration and the driver is detectable rather than silently misaligned.
+    """
+    _fields_ = [
+        ('Size', wintypes.ULONG),
+        ('DropsNoClient', wintypes.ULONG),
+        ('DropsAllocFailed', wintypes.ULONG),
+        ('HostToCtrlCount', wintypes.ULONG),
+        ('HostToCtrlPeak', wintypes.ULONG),
+        ('PendingEventCount', wintypes.ULONG),
+        ('PendingEventPeak', wintypes.ULONG),
+        ('PendingDataCount', wintypes.ULONG),
+        ('PendingDataPeak', wintypes.ULONG),
+        ('WritesTotal', wintypes.ULONG),
+        ('QueuedToUserTotal', wintypes.ULONG),
+        ('WritesPended', wintypes.ULONG),
+        ('WritesWaiting', wintypes.ULONG),
+    ]
+
+
+@dataclass(frozen=True)
+class VhciStats:
+    """A snapshot of the driver's packet counters.
+
+    The counters exist because packet loss in this driver is otherwise
+    invisible: a dropped advertising report looks exactly like a device that
+    was never advertising, which is a failure mode that costs hours to
+    diagnose from the outside. A test that cares about loss should assert on
+    :attr:`drops_no_client` and :attr:`drops_alloc_failed` being unchanged
+    rather than on any observable behaviour.
+    """
+
+    #: Packets discarded because no client had the device open. Non-zero means
+    #: a client went away mid-flight.
+    drops_no_client: int
+    #: Packets discarded because the pool allocation failed.
+    drops_alloc_failed: int
+
+    #: Depth and high-water mark of the stack-to-userspace backlog. This
+    #: direction is deliberately unbounded - its producer is the Bluetooth
+    #: stack, which cannot be told to wait - so the peak is informational.
+    host_to_ctrl_count: int
+    host_to_ctrl_peak: int
+
+    #: Depth and high-water mark of the two userspace-to-stack backlogs.
+    pending_event_count: int
+    pending_event_peak: int
+    pending_data_count: int
+    pending_data_peak: int
+
+    #: Totals moved each way. These are the denominators: without them a flat
+    #: :attr:`writes_pended` is ambiguous between "userspace sent nothing" and
+    #: "userspace sent plenty and the stack kept up".
+    writes_total: int
+    queued_to_user_total: int
+
+    #: How many userspace writes have been pended for backpressure in total,
+    #: and how many are waiting right now. A rising total with a healthy stack
+    #: is normal; a persistently non-zero :attr:`writes_waiting` means the
+    #: stack stopped draining.
+    writes_pended: int
+    writes_waiting: int
+
+    @property
+    def total_drops(self) -> int:
+        return self.drops_no_client + self.drops_alloc_failed
+
+    @classmethod
+    def _from_struct(cls, raw: _WINVHCI_STATS) -> 'VhciStats':
+        return cls(
+            drops_no_client=raw.DropsNoClient,
+            drops_alloc_failed=raw.DropsAllocFailed,
+            host_to_ctrl_count=raw.HostToCtrlCount,
+            host_to_ctrl_peak=raw.HostToCtrlPeak,
+            pending_event_count=raw.PendingEventCount,
+            pending_event_peak=raw.PendingEventPeak,
+            pending_data_count=raw.PendingDataCount,
+            pending_data_peak=raw.PendingDataPeak,
+            writes_total=raw.WritesTotal,
+            queued_to_user_total=raw.QueuedToUserTotal,
+            writes_pended=raw.WritesPended,
+            writes_waiting=raw.WritesWaiting,
+        )
 
 
 class _OVERLAPPED(ctypes.Structure):
@@ -305,6 +425,35 @@ class _Kernel32:
         )
         self.ResetEvent.errcheck = _check_bool('ResetEvent')
 
+        # Called synchronously even though the handle is overlapped. That is
+        # legal, and the stats IOCTL completes in the driver's dispatch routine
+        # without ever pending, so there is no completion to wait for. Passing
+        # a NULL OVERLAPPED on an overlapped handle would be a bug for an
+        # operation that *can* pend - hence the note, not just the code.
+        self.DeviceIoControl = ctypes.WINFUNCTYPE(
+            wintypes.BOOL,
+            wintypes.HANDLE,                    # hDevice
+            wintypes.DWORD,                     # dwIoControlCode
+            ctypes.c_void_p,                    # lpInBuffer
+            wintypes.DWORD,                     # nInBufferSize
+            ctypes.c_void_p,                    # lpOutBuffer
+            wintypes.DWORD,                     # nOutBufferSize
+            ctypes.POINTER(wintypes.DWORD),     # lpBytesReturned
+            _LPOVERLAPPED,                      # lpOverlapped
+            use_last_error=True,
+        )(
+            ('DeviceIoControl', kernel32),
+            ((1, 'hDevice'),
+             (1, 'dwIoControlCode'),
+             (1, 'lpInBuffer', None),
+             (1, 'nInBufferSize', 0),
+             (1, 'lpOutBuffer'),
+             (1, 'nOutBufferSize'),
+             (2, 'lpBytesReturned'),
+             (1, 'lpOverlapped', None)),
+        )
+        self.DeviceIoControl.errcheck = _check_bool_with_outputs('DeviceIoControl')
+
         # No errcheck on either of these. Both are called during teardown where
         # failure is expected and uninteresting: CancelIoEx returns
         # ERROR_NOT_FOUND when nothing is pending, and raising out of a close
@@ -504,6 +653,42 @@ class VhciDevice:
 
         if transferred != len(data):
             raise VhciError(f'short write: {transferred} of {len(data)} bytes')
+
+    # -- statistics --------------------------------------------------------
+
+    def stats(self) -> VhciStats:
+        """Read the driver's packet counters.
+
+        Cheap, and safe to call at any time - the driver snapshots the
+        counters under its spinlock and completes the IOCTL inline.
+        """
+        handle = self._handle
+        if handle is None:
+            raise VhciError('device is closed')
+
+        raw = _WINVHCI_STATS()
+        try:
+            returned = self._api.DeviceIoControl(
+                hDevice=handle,
+                dwIoControlCode=_IOCTL_WINVHCI_GET_STATS,
+                lpOutBuffer=ctypes.byref(raw),
+                nOutBufferSize=ctypes.sizeof(raw),
+            )
+        except OSError as error:
+            raise VhciError(
+                f'DeviceIoControl(GET_STATS) failed: {error}') from error
+
+        if returned < ctypes.sizeof(raw) or raw.Size != ctypes.sizeof(raw):
+            raise VhciError(
+                f'WINVHCI_STATS size mismatch: driver reports {raw.Size} '
+                f'bytes and returned {returned}, this client expects '
+                f'{ctypes.sizeof(raw)}. The driver and winvhci package are '
+                f'from different builds.')
+
+        return VhciStats._from_struct(raw)
+
+    async def stats_async(self) -> VhciStats:
+        return await asyncio.to_thread(self.stats)
 
     # -- asyncio -----------------------------------------------------------
     #

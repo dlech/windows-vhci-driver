@@ -10,6 +10,7 @@ from winvhci.device import (
     MAX_H4_PACKET,
     VhciDevice,
     VhciError,
+    VhciStats,
 )
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     'MAX_H4_PACKET',
     'VhciDevice',
     'VhciError',
+    'VhciStats',
     '__version__',
 ]
 

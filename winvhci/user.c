@@ -85,7 +85,38 @@ WinVhciPurgeBacklogs(
     _In_ PWINVHCI_FDO_CONTEXT Ctx
     )
 {
+    //
+    // Pended writes first, and OUTSIDE the lock, by draining the queue by hand
+    // rather than purging it.
+    //
+    // WdfIoQueuePurgeSynchronously was the obvious choice and it DEADLOCKS
+    // here. One caller of this function is EvtFileClose, and purging
+    // synchronously waits for the queue to drain from inside the very callback
+    // the framework is running for that file object. The symptom is not a hang
+    // anyone would attribute to a queue: the close never finishes, so Owner
+    // stays set and the radio stays alive, and the next CreateFile on an
+    // exclusive device fails with ERROR_ACCESS_DENIED - which reads as a
+    // permissions problem, not as a driver that never let go.
+    //
+    // Retrieve-and-complete has none of those constraints, needs no
+    // WdfIoQueueStart afterwards because the queue is never stopped, and is
+    // less machinery for the same effect.
+    //
+    // Draining is not optional. A request the framework still owns when the
+    // device goes away is what BugCheck 0xC4
+    // (DRIVER_VERIFIER_DETECTED_VIOLATION) is for, and this driver has already
+    // been bitten once by that shape of bug - packets queued for a client that
+    // had gone, surviving until unload.
+    //
+    if (Ctx->WriteWaitQueue != NULL) {
+        WDFREQUEST request;
+        while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Ctx->WriteWaitQueue, &request))) {
+            WdfRequestCompleteWithInformation(request, STATUS_CANCELLED, 0);
+        }
+    }
+
     WdfSpinLockAcquire(Ctx->Lock);
+    Ctx->WritesWaiting = 0;
     WinVhciFreeList(&Ctx->HostToCtrlList,   &Ctx->HostToCtrlCount);
     WinVhciFreeList(&Ctx->PendingEventList, &Ctx->PendingEventCount);
     WinVhciFreeList(&Ctx->PendingDataList,  &Ctx->PendingDataCount);
@@ -140,7 +171,7 @@ Routine Description:
     // driver defect.
     //
     if (Ctx->Owner == NULL) {
-        Ctx->DropCount++;
+        Ctx->DropsNoClient++;
         WdfSpinLockRelease(Ctx->Lock);
         return;
     }
@@ -160,25 +191,41 @@ Routine Description:
     if (request == NULL) {
         PWINVHCI_PACKET p;
 
-        if (Ctx->HostToCtrlCount >= WINVHCI_MAX_BACKLOG) {
-            Ctx->DropCount++;
-            WdfSpinLockRelease(Ctx->Lock);
-            KdPrint(("winvhci: host->user backlog full, dropped type 0x%02x (%u dropped)\n",
-                     Type, Ctx->DropCount));
-            return;
-        }
-
+        //
+        // NOT bounded, deliberately. The producer here is BthPort, which
+        // cannot be told to wait - these are HCI commands and ACL data it has
+        // already handed off - and discarding one silently breaks bring-up
+        // with nothing to recover from and no way to report it. This used to
+        // drop at a depth of 64 and count into a counter userspace could not
+        // read, so the loss looked like a device that would not initialise.
+        //
+        // A client that stops reading therefore grows this list. That is the
+        // client's own memory footprint to answer for, it is bounded in
+        // practice by how much the stack will send before it needs an answer,
+        // and it is visible: HostToCtrlPeak says exactly how deep it went.
+        //
         p = WinVhciTestFailAlloc(Ctx)
                 ? NULL
                 : WinVhciAllocPacket(Type, Body, Length);
         if (p == NULL) {
-            Ctx->DropCount++;
+            //
+            // The one remaining loss on this path, and unavoidable: there is
+            // no way to pend a packet we cannot allocate. Counted separately
+            // from a vanished client because this one is a real problem.
+            //
+            Ctx->DropsAllocFailed++;
             WdfSpinLockRelease(Ctx->Lock);
+            KdPrint(("winvhci: host->user alloc failed, lost type 0x%02x (%u lost)\n",
+                     Type, Ctx->DropsAllocFailed));
             return;
         }
 
         InsertTailList(&Ctx->HostToCtrlList, &p->Link);
         Ctx->HostToCtrlCount++;
+        Ctx->QueuedToUserTotal++;
+        if (Ctx->HostToCtrlCount > Ctx->HostToCtrlPeak) {
+            Ctx->HostToCtrlPeak = Ctx->HostToCtrlCount;
+        }
         WdfSpinLockRelease(Ctx->Lock);
         return;
     }
@@ -285,6 +332,18 @@ WinVhciTakePendingForStack(
     }
     WdfSpinLockRelease(Ctx->Lock);
 
+    //
+    // A slot just came free, so one write pended for backpressure can proceed.
+    // This is the ONLY place the bounded direction shrinks, which is why it is
+    // the only place that needs to release a waiter.
+    //
+    // Deliberately after the lock is released: re-dispatching the write
+    // acquires it again.
+    //
+    if (p != NULL) {
+        WinVhciDrainWriteWaiters(Ctx);
+    }
+
     return p;
 }
 
@@ -356,19 +415,35 @@ Routine Description:
     return STATUS_SUCCESS;
 }
 
-VOID
-WinVhciEvtIoWrite(
-    _In_ WDFQUEUE   Queue,
-    _In_ WDFREQUEST Request,
-    _In_ size_t     Length
+static VOID
+WinVhciDispatchWrite(
+    _In_ PWINVHCI_FDO_CONTEXT ctx,
+    _In_ WDFREQUEST           Request
     )
+/*++
+
+Routine Description:
+
+    One userspace write, from the queue callback OR from the backpressure
+    drain. Both go through here so a re-released write is handled identically
+    to a fresh one - including being pended again, if the stack has filled the
+    backlog back up in the meantime.
+
+    The transfer length is taken from the request rather than passed in,
+    because the drain path has only the request.
+
+--*/
 {
-    WDFDEVICE            device = WdfIoQueueGetDevice(Queue);
-    PWINVHCI_FDO_CONTEXT ctx    = WinVhciFdoGetContext(device);
-    PUCHAR               buffer;
-    size_t               bufferLength;
-    UCHAR                type;
-    NTSTATUS             status;
+    WDF_REQUEST_PARAMETERS params;
+    PUCHAR                 buffer;
+    size_t                 bufferLength;
+    size_t                 Length;
+    UCHAR                  type;
+    NTSTATUS               status;
+
+    WDF_REQUEST_PARAMETERS_INIT(&params);
+    WdfRequestGetParameters(Request, &params);
+    Length = params.Parameters.Write.Length;
 
     if (Length < 2 || Length > WINVHCI_MAX_H4_PACKET) {
         WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
@@ -419,12 +494,167 @@ WinVhciEvtIoWrite(
     }
 
     //
+    // Backpressure: the stack's backlog is full, so this write waits on
+    // WriteWaitQueue instead of failing. WinVhciDrainWriteWaiters releases it
+    // when the stack takes a packet off the list.
+    //
+    // Nothing is lost and nothing is completed here - the request stays alive,
+    // owned by the queue, and the client's WriteFile simply has not returned
+    // yet. An overlapped client sees ERROR_IO_PENDING, which it already
+    // handles for every write.
+    //
+    if (status == STATUS_PENDING) {
+        NTSTATUS forwarded = WdfRequestForwardToIoQueue(Request, ctx->WriteWaitQueue);
+        if (!NT_SUCCESS(forwarded)) {
+            //
+            // Only happens if the queue is being purged, i.e. the device or
+            // the handle is going away. Complete it rather than leak it.
+            //
+            KdPrint(("winvhci: cannot pend write (%!STATUS!), completing\n", forwarded));
+            WdfRequestCompleteWithInformation(Request, forwarded, 0);
+            return;
+        }
+
+        WdfSpinLockAcquire(ctx->Lock);
+        ctx->WritesPended++;
+        ctx->WritesWaiting++;
+        WdfSpinLockRelease(ctx->Lock);
+        return;
+    }
+
+    //
     // Report the whole transfer as consumed on success, so a client's write
     // loop does not have to reason about the type byte.
     //
     WdfRequestCompleteWithInformation(Request,
                                       status,
                                       NT_SUCCESS(status) ? Length : 0);
+}
+
+VOID
+WinVhciDrainWriteWaiters(
+    _In_ PWINVHCI_FDO_CONTEXT Ctx
+    )
+/*++
+
+Routine Description:
+
+    Release ONE write that was pended for backpressure, because one slot has
+    just been freed. Exactly one, so a freed slot cannot release a waiter that
+    then has nowhere to go - and if the released write finds the backlog full
+    again it simply pends again, which is correct rather than a spin.
+
+    Called with the lock NOT held: re-dispatching acquires it.
+
+--*/
+{
+    WDFREQUEST request;
+
+    if (Ctx->WriteWaitQueue == NULL) {
+        return;
+    }
+
+    if (!NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Ctx->WriteWaitQueue, &request))) {
+        return;
+    }
+
+    WdfSpinLockAcquire(Ctx->Lock);
+    if (Ctx->WritesWaiting > 0) {
+        Ctx->WritesWaiting--;
+    }
+    WdfSpinLockRelease(Ctx->Lock);
+
+    WinVhciDispatchWrite(Ctx, request);
+}
+
+VOID
+WinVhciEvtIoWrite(
+    _In_ WDFQUEUE   Queue,
+    _In_ WDFREQUEST Request,
+    _In_ size_t     Length
+    )
+{
+    UNREFERENCED_PARAMETER(Length);   // taken from the request instead
+
+    WinVhciDispatchWrite(WinVhciFdoGetContext(WdfIoQueueGetDevice(Queue)), Request);
+}
+
+VOID
+WinVhciEvtIoDeviceControl(
+    _In_ WDFQUEUE   Queue,
+    _In_ WDFREQUEST Request,
+    _In_ size_t     OutputBufferLength,
+    _In_ size_t     InputBufferLength,
+    _In_ ULONG      IoControlCode
+    )
+/*++
+
+Routine Description:
+
+    IOCTL_WINVHCI_GET_STATS, so a test can assert the driver lost nothing
+    instead of inferring it from behaviour. Before this existed the counters
+    were incremented and then only printed with KdPrint, which is compiled out
+    of a Release build and discarded anyway when no debugger is attached - so a
+    lost packet was indistinguishable from a device that would not initialise.
+
+--*/
+{
+    WDFDEVICE            device = WdfIoQueueGetDevice(Queue);
+    PWINVHCI_FDO_CONTEXT ctx    = WinVhciFdoGetContext(device);
+    PWINVHCI_STATS       out;
+    size_t               outLength;
+    NTSTATUS             status;
+
+    UNREFERENCED_PARAMETER(InputBufferLength);
+
+    if (IoControlCode != IOCTL_WINVHCI_GET_STATS) {
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
+        return;
+    }
+
+    if (OutputBufferLength < sizeof(WINVHCI_STATS)) {
+        //
+        // Report what is needed, so a caller built against an older header
+        // learns the size rather than guessing.
+        //
+        WdfRequestCompleteWithInformation(Request,
+                                          STATUS_BUFFER_TOO_SMALL,
+                                          sizeof(WINVHCI_STATS));
+        return;
+    }
+
+    status = WdfRequestRetrieveOutputBuffer(Request,
+                                            sizeof(WINVHCI_STATS),
+                                            (PVOID *)&out,
+                                            &outLength);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    RtlZeroMemory(out, sizeof(*out));
+    out->Size = sizeof(WINVHCI_STATS);
+
+    //
+    // Under the lock, so the snapshot is internally consistent: a caller
+    // comparing a count against its peak should never see the count exceed it.
+    //
+    WdfSpinLockAcquire(ctx->Lock);
+    out->DropsNoClient     = ctx->DropsNoClient;
+    out->DropsAllocFailed  = ctx->DropsAllocFailed;
+    out->HostToCtrlCount   = ctx->HostToCtrlCount;
+    out->HostToCtrlPeak    = ctx->HostToCtrlPeak;
+    out->PendingEventCount = ctx->PendingEventCount;
+    out->PendingEventPeak  = ctx->PendingEventPeak;
+    out->PendingDataCount  = ctx->PendingDataCount;
+    out->PendingDataPeak   = ctx->PendingDataPeak;
+    out->WritesTotal       = ctx->WritesTotal;
+    out->QueuedToUserTotal = ctx->QueuedToUserTotal;
+    out->WritesPended      = ctx->WritesPended;
+    out->WritesWaiting     = ctx->WritesWaiting;
+    WdfSpinLockRelease(ctx->Lock);
+
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(WINVHCI_STATS));
 }
 
 // ---------------------------------------------------------------------------
@@ -550,8 +780,9 @@ WinVhciUserCreateQueues(
     //
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&config, WdfIoQueueDispatchParallel);
     config.PowerManaged = WdfFalse;
-    config.EvtIoRead    = WinVhciEvtIoRead;
-    config.EvtIoWrite   = WinVhciEvtIoWrite;
+    config.EvtIoRead          = WinVhciEvtIoRead;
+    config.EvtIoWrite         = WinVhciEvtIoWrite;
+    config.EvtIoDeviceControl = WinVhciEvtIoDeviceControl;
 
     status = WdfIoQueueCreate(Device, &config, WDF_NO_OBJECT_ATTRIBUTES, &defaultQueue);
     if (!NT_SUCCESS(status)) {
@@ -565,6 +796,19 @@ WinVhciUserCreateQueues(
     status = WdfIoQueueCreate(Device, &config, WDF_NO_OBJECT_ATTRIBUTES, &ctx->UserReadQueue);
     if (!NT_SUCCESS(status)) {
         KdPrint(("winvhci: UserReadQueue create failed 0x%08x\n", status));
+        return status;
+    }
+
+    //
+    // Writes pended for backpressure. Manual, because nothing dispatches these
+    // except WinVhciDrainWriteWaiters when the stack frees a slot.
+    //
+    WDF_IO_QUEUE_CONFIG_INIT(&config, WdfIoQueueDispatchManual);
+    config.PowerManaged = WdfFalse;
+
+    status = WdfIoQueueCreate(Device, &config, WDF_NO_OBJECT_ATTRIBUTES, &ctx->WriteWaitQueue);
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("winvhci: WriteWaitQueue create failed 0x%08x\n", status));
         return status;
     }
 

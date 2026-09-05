@@ -264,11 +264,30 @@ Routine Description:
     if (request == NULL) {
         PWINVHCI_PACKET p;
 
+        //
+        // Backpressure rather than loss. The producer is the userspace client,
+        // so it can be made to wait: STATUS_PENDING tells the write path to
+        // park its WDFREQUEST on WriteWaitQueue, and WinVhciDrainWriteWaiters
+        // releases it when the stack takes a packet off this list.
+        //
+        // This used to drop the packet and fail the write with
+        // STATUS_INSUFFICIENT_RESOURCES. Failing the write is at least visible,
+        // but it is visible in the wrong place: a Bumble sink pump treats any
+        // write exception as fatal and stops sending forever, so one transient
+        // full backlog silently ends the session.
+        //
         if (*count >= WINVHCI_MAX_BACKLOG) {
-            Ctx->DropCount++;
+            //
+            // Deliberately NOT counted in WritesTotal. This write is going to
+            // be pended and dispatched again, and counting it on both passes
+            // would make the total exceed what userspace actually sent -
+            // which is precisely the number the other counters are read
+            // against.
+            //
             WdfSpinLockRelease(Ctx->Lock);
-            KdPrint(("winvhci: stack backlog full, dropped type 0x%02x\n", Type));
-            return STATUS_INSUFFICIENT_RESOURCES;
+            KdPrint(("winvhci: stack backlog full (%u), pending the write of type 0x%02x\n",
+                     *count, Type));
+            return STATUS_PENDING;
         }
 
         p = WinVhciTestFailAlloc(Ctx)
@@ -278,7 +297,7 @@ Routine Description:
                       FIELD_OFFSET(WINVHCI_PACKET, Data) + Length,
                       WINVHCI_POOL_TAG);
         if (p == NULL) {
-            Ctx->DropCount++;
+            Ctx->DropsAllocFailed++;
             WdfSpinLockRelease(Ctx->Lock);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -291,6 +310,12 @@ Routine Description:
 
         InsertTailList(head, &p->Link);
         (*count)++;
+        Ctx->WritesTotal++;
+        if (Type == WINVHCI_H4_ACL) {
+            if (*count > Ctx->PendingDataPeak) { Ctx->PendingDataPeak = *count; }
+        } else {
+            if (*count > Ctx->PendingEventPeak) { Ctx->PendingEventPeak = *count; }
+        }
         WdfSpinLockRelease(Ctx->Lock);
 
         KdPrint(("winvhci: no read pended for type 0x%02x, queued (%u waiting)\n",
@@ -298,6 +323,7 @@ Routine Description:
         return STATUS_SUCCESS;
     }
 
+    Ctx->WritesTotal++;
     WdfSpinLockRelease(Ctx->Lock);
 
     KdPrint(("winvhci: delivering type 0x%02x, %u bytes to the stack\n", Type, Length));
