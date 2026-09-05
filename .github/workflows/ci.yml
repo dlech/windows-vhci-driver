@@ -136,13 +136,32 @@ jobs:
           name: winvhci-${{ matrix.platform }}-Debug
           path: pkg
 
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: '3.12'
+
+      - name: Install Bumble
+        shell: pwsh
+        run: |
+          # --no-deps deliberately. Bumble's full dependency set pulls in grpcio
+          # (its gRPC bridge) and cryptography, and neither has an arm64 Windows
+          # wheel, so both try to compile from source and fail. Nothing this
+          # controller does needs either: verified on an arm64 Windows machine
+          # that bumble plus these two imports, starts, serves HCI over TCP and
+          # advertises a peer.
+          python -m pip install --disable-pip-version-check --no-deps bumble
+          python -m pip install --disable-pip-version-check typing_extensions pyee
+          python -c "import bumble; print('bumble', bumble.__version__)"
+
       - name: Install and assert
         # Windows PowerShell 5.1, not pwsh: tools\vhci-io.ps1 and the WinRT
         # paths this leads to are written for it, and PowerShell 7 dropped the
         # WindowsRuntime type accelerator.
         shell: powershell
         run: |
-          .\build\ci\smoke.ps1 -PackageDir pkg -Json smoke-${{ matrix.platform }}.json
+          .\build\ci\smoke.ps1 -PackageDir pkg -Bumble -Python "${{ steps.py.outputs.python-path }}" `
+            -Json smoke-${{ matrix.platform }}.json
 
       - name: Collect diagnostics
         if: always()
@@ -157,6 +176,10 @@ jobs:
           Get-WinEvent -LogName System -MaxEvents 200 -ErrorAction SilentlyContinue |
             Format-List TimeCreated, Id, ProviderName, Message | Out-File diag\system-events.txt
           Copy-Item smoke-*.json diag\ -ErrorAction SilentlyContinue
+          # The controller's own view. When Windows stops partway through
+          # initialisation this is where the last command it asked for shows up,
+          # which is what identifies the missing handler.
+          Copy-Item bumble.*.log diag\ -ErrorAction SilentlyContinue
 
       - uses: actions/upload-artifact@v4
         if: always()

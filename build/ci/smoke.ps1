@@ -22,7 +22,20 @@ param(
     [string]$PackageDir = 'out',
     [string]$ToolsDir,
     [string]$Json,
-    [int]   $SettleSec = 30
+    [int]   $SettleSec = 30,
+
+    # Tier 2: drive the radio with a real controller emulator instead of
+    # vhcictl's hand-written answers, and assert that Windows builds its whole
+    # Bluetooth stack on top and discovers an advertising peer.
+    [switch]$Bumble,
+    [string]$Python = 'python',
+    [int]   $BumblePort = 6402,
+    # Only a backstop. The bridge is killed explicitly when the tier finishes;
+    # this has to comfortably outlast the assertions, because if it expires
+    # early the handle closes, the radio vanishes, and every remaining check
+    # fails for a reason that has nothing to do with the driver. A single
+    # FindAllAsync scan can take 90 seconds on its own.
+    [int]   $BumbleSec  = 600
 )
 
 $ErrorActionPreference = 'Stop'
@@ -212,6 +225,131 @@ Write-Host '=== Handle-scoped lifetime ===' -ForegroundColor Cyan
 Check 'radio PDO disappears when the client closes' {
     Wait-For 'the WINVHCI\RADIO node to go away' { -not (Get-Radio) } 40
 } 'tearing the node down unloads BthPort''s whole stack above it, so it is not instant'
+
+if ($Bumble) {
+    Write-Host ''
+    Write-Host '=== Tier 2: a real controller, and the stack Windows builds on it ===' -ForegroundColor Cyan
+
+    # Tier 1 proves the transport. It does not prove the stack: vhcictl answers
+    # with plausible constants and Windows gets no further than a radio node.
+    # Only a controller that actually implements the initialisation sequence
+    # makes Windows bring up the enumerator and RFCOMM nodes, and those are what
+    # signal real success - see docs/controller-requirements.md.
+    #
+    # Bumble runs here on the runner itself, so the bridge connects to
+    # 127.0.0.1 rather than the 10.0.2.2 slirp gateway the QEMU guest uses.
+    . (Join-Path $ToolsDir 'winrt-await.ps1')
+    $null = [Windows.Devices.Bluetooth.BluetoothAdapter, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
+    $null = [Windows.Devices.Radios.Radio, Windows.System.Devices, ContentType = WindowsRuntime]
+    $null = [Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType = WindowsRuntime]
+
+    $bumbleOut = Join-Path (Get-Location) 'bumble.out.log'
+    $bumbleErr = Join-Path (Get-Location) 'bumble.err.log'
+
+    $controller = Start-Process $Python -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $bumbleOut -RedirectStandardError $bumbleErr `
+        -ArgumentList @((Join-Path $ToolsDir 'bumble-controller.py'),
+                        '--peer', '--dual-mode', '--host', '127.0.0.1', '--port', "$BumblePort")
+    $null = $controller.Handle
+    $bridge = $null
+
+    try {
+        # Wait on the log line, not on a TCP connect. Bumble's tcp-server
+        # transport serves one HCI client, so probing the port would consume the
+        # connection the bridge is about to need.
+        Check 'Bumble controller starts and listens' {
+            Wait-For 'the controller to announce its listener' {
+                (Test-Path $bumbleOut) -and
+                (Select-String -Path $bumbleOut -Pattern 'listening for an HCI client' -Quiet)
+            } 60
+        } "see bumble.out.log / bumble.err.log"
+
+        $bridge = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass',
+            '-File', (Join-Path $ToolsDir 'vhcibridge.ps1'),
+            '-RemoteHost', '127.0.0.1', '-Port', "$BumblePort", '-Seconds', "$BumbleSec"
+        )
+        $null = $bridge.Handle
+        Write-Host "  bridge started (pid $($bridge.Id))"
+
+        Check 'radio reaches Status OK with a real controller' {
+            Wait-For 'the radio node to come up' { (Get-Radio) -and (Get-Radio).Status -eq 'OK' } 60
+        }
+
+        # These two are the real signal. The radio node appears as soon as the
+        # transport handshake completes, but BthPort only creates the enumerator
+        # and RFCOMM nodes once the controller has answered the whole
+        # initialisation sequence convincingly.
+        Check 'Microsoft Bluetooth Enumerator appears' {
+            Wait-For 'BTH\MS_BTHBRB' {
+                @(Get-PnpDevice -PresentOnly -InstanceId 'BTH\MS_BTHBRB\*' -ErrorAction SilentlyContinue).Count -gt 0
+            } 90
+        } 'BthPort creates this only after a convincing initialisation sequence'
+
+        Check 'RFCOMM node appears' {
+            Wait-For 'BTH\MS_RFCOMM' {
+                @(Get-PnpDevice -PresentOnly -InstanceId 'BTH\MS_RFCOMM\*' -ErrorAction SilentlyContinue).Count -gt 0
+            } 90
+        }
+
+        Check 'bthserv is running' {
+            Wait-For 'bthserv to reach Running' {
+                (Get-Service bthserv -ErrorAction SilentlyContinue).Status -eq 'Running'
+            } 60
+        }
+
+        # Now ask the layer an ordinary application uses.
+        $adapter = $null
+        Check 'BluetoothAdapter.GetDefaultAsync returns an adapter' {
+            $script:adapter = Await ([Windows.Devices.Bluetooth.BluetoothAdapter]::GetDefaultAsync()) `
+                                    ([Windows.Devices.Bluetooth.BluetoothAdapter]) 30000
+            $null -ne $script:adapter
+        } 'WinRT sees no adapter even though PnP does'
+
+        if ($script:adapter) {
+            $addr = ('{0:X12}' -f $script:adapter.BluetoothAddress) -replace '(..)(?=.)', '$1:'
+            Write-Host "  adapter $addr  LE=$($script:adapter.IsLowEnergySupported) Classic=$($script:adapter.IsClassicSupported) Central=$($script:adapter.IsCentralRoleSupported)"
+
+            # The controller is started with the default --address, so this also
+            # proves Windows read BD_ADDR from the emulator rather than
+            # inventing one.
+            Check 'adapter address is the controller''s BD_ADDR' { $addr -eq 'F0:F1:F2:F3:F4:F5' } `
+                  "expected F0:F1:F2:F3:F4:F5, got $addr"
+            Check 'adapter reports LE support'      { $script:adapter.IsLowEnergySupported }
+            Check 'adapter reports Classic support' { $script:adapter.IsClassicSupported } `
+                  'requires --dual-mode; BR_EDR_NOT_SUPPORTED must be cleared'
+            Check 'adapter supports the central role' { $script:adapter.IsCentralRoleSupported }
+
+            Check 'radio state is On' {
+                $r = Await ($script:adapter.GetRadioAsync()) ([Windows.Devices.Radios.Radio]) 15000
+                $r.State -eq 'On'
+            }
+        }
+
+        # Discovery, using FindAllAsync rather than a watcher: Windows
+        # PowerShell 5.1 cannot subscribe to WinRT events at all, so an
+        # event-driven watcher is silent here for reasons that have nothing to
+        # do with the driver. FindAllAsync performs a real scan and returns a
+        # collection, so it is the check that can actually fail meaningfully.
+        Check 'Windows discovers the advertising peer' {
+            $sel = [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($false)
+            $found = Await ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($sel)) `
+                           ([Windows.Devices.Enumeration.DeviceInformationCollection]) 90000
+            foreach ($d in $found) { Write-Host "    '$($d.Name)'  $($d.Id)" }
+            @($found | Where-Object { $_.Name -eq 'BumblePeer' -or $_.Id -match 'aa:bb:cc:dd:ee:ff' }).Count -gt 0
+        } 'the peer advertises from a random address; --peer-address-type public stops discovery working'
+    }
+    finally {
+        foreach ($proc in $bridge, $controller) {
+            if ($proc -and -not $proc.HasExited) { $proc.Kill(); $proc.WaitForExit(10000) | Out-Null }
+        }
+        Write-Host '  bridge and controller stopped'
+    }
+
+    Check 'radio goes away when the bridge dies' {
+        Wait-For 'the radio node to go away' { -not (Get-Radio) } 40
+    } 'the bridge is killed outright, so this is the abrupt-client-death path'
+}
 
 Write-Host ''
 Write-Host '=== Bugcheck check ===' -ForegroundColor Cyan
