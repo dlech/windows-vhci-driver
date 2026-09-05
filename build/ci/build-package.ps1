@@ -22,7 +22,20 @@ param(
     [string]$OutDir       = 'out',
     [string]$WdkVersion   = '10.0.28000.2526',
     [string]$SdkVersion   = '10.0.28000.0',
-    [string]$CertSubject  = 'CN=winvhci CI test signing'
+    [string]$CertSubject  = 'CN=winvhci CI test signing',
+
+    # A PFX to sign with, instead of generating a throwaway certificate.
+    #
+    # Releases use this so that every release is signed by the SAME
+    # certificate: install-winvhci.ps1 imports the signer into the machine's
+    # Root and TrustedPublisher stores, and with an ephemeral certificate each
+    # upgrade would ask the user to trust a new one and leave the old behind.
+    #
+    # Left empty everywhere else, deliberately. Test signing accepts a
+    # signature from any certificate, chain or no chain, so CI needs no secret
+    # and a pull request from a fork still produces a fully installable package.
+    [string]$Pfx,
+    [string]$PfxPassword
 )
 
 $ErrorActionPreference = 'Stop'
@@ -107,24 +120,51 @@ $pkg = Join-Path $repo "winvhci\$Platform\$Configuration\winvhci"
 if (-not (Test-Path (Join-Path $pkg 'winvhci.sys'))) { throw "No driver package at $pkg" }
 
 # ---------------------------------------------------------------------------
-Step 'Creating an ephemeral test-signing certificate'
+if ($Pfx) {
+    Step 'Importing the release signing certificate'
+    if (-not (Test-Path $Pfx)) { throw "PFX not found: $Pfx" }
 
-# Test signing accepts a signature from ANY certificate - the chain need not
-# reach a trusted root - so a per-job self-signed cert is sufficient and no
-# secret is needed. That is what lets pull requests from forks produce a fully
-# installable package.
-$cert = New-SelfSignedCertificate `
-    -Type CodeSigningCert `
-    -Subject $CertSubject `
-    -KeyAlgorithm RSA -KeyLength 3072 -HashAlgorithm SHA256 `
-    -CertStoreLocation Cert:\CurrentUser\My `
-    -KeyExportPolicy Exportable `
-    -NotAfter (Get-Date).AddYears(5) `
-    -TextExtension @(
-        '2.5.29.37={text}1.3.6.1.5.5.7.3.3',   # EKU: Code Signing
-        '2.5.29.19={text}'                     # Basic Constraints: end entity
-    )
-Write-Host "  thumbprint $($cert.Thumbprint)"
+    # -Exportable is not needed to sign, and leaving it off means the private
+    # key cannot be pulled back out of the store by anything else running on the
+    # build agent.
+    $cert = Import-PfxCertificate `
+        -FilePath (Resolve-Path $Pfx).Path `
+        -CertStoreLocation Cert:\CurrentUser\My `
+        -Password (ConvertTo-SecureString $PfxPassword -AsPlainText -Force)
+
+    Write-Host "  subject    $($cert.Subject)"
+    Write-Host "  thumbprint $($cert.Thumbprint)"
+    Write-Host "  expires    $($cert.NotAfter.ToString('yyyy-MM-dd'))"
+
+    # An expired signer does not make pnputil fail, it makes it HANG - msquic
+    # lost a support issue to exactly this - so it is worth refusing here, where
+    # the message can say what is wrong.
+    if ($cert.NotAfter -lt (Get-Date)) {
+        throw "the signing certificate expired on $($cert.NotAfter.ToString('yyyy-MM-dd'))"
+    }
+    if ($cert.NotAfter -lt (Get-Date).AddDays(90)) {
+        Write-Warning "the signing certificate expires on $($cert.NotAfter.ToString('yyyy-MM-dd'))"
+    }
+} else {
+    Step 'Creating an ephemeral test-signing certificate'
+
+    # Test signing accepts a signature from ANY certificate - the chain need not
+    # reach a trusted root - so a per-job self-signed cert is sufficient and no
+    # secret is needed. That is what lets pull requests from forks produce a
+    # fully installable package.
+    $cert = New-SelfSignedCertificate `
+        -Type CodeSigningCert `
+        -Subject $CertSubject `
+        -KeyAlgorithm RSA -KeyLength 3072 -HashAlgorithm SHA256 `
+        -CertStoreLocation Cert:\CurrentUser\My `
+        -KeyExportPolicy Exportable `
+        -NotAfter (Get-Date).AddYears(5) `
+        -TextExtension @(
+            '2.5.29.37={text}1.3.6.1.5.5.7.3.3',   # EKU: Code Signing
+            '2.5.29.19={text}'                     # Basic Constraints: end entity
+        )
+    Write-Host "  thumbprint $($cert.Thumbprint)"
+}
 
 $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe -File -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -match "\\$($Platform.ToLower())\\" -or $_.FullName -match '\\x64\\' } |
@@ -182,9 +222,11 @@ foreach ($f in 'winvhci.sys', 'winvhci.cat') {
     Write-Host "  $f signed by $($sig.SignerCertificate.Subject) [$($sig.Status)]"
 }
 
-# The private key has done its job. Leave nothing behind in the personal store.
+# The private key has done its job. Leave nothing behind in the personal store -
+# which matters more for a release, where the key came from a secret and outlives
+# the job, than for the ephemeral case where it never existed anywhere else.
 Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -Force -ErrorAction SilentlyContinue
-Write-Host '  removed the ephemeral certificate from CurrentUser\My'
+Write-Host '  removed the signing certificate from CurrentUser\My'
 
 # ---------------------------------------------------------------------------
 Step 'Staging the artifact'
@@ -196,6 +238,13 @@ Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path (Join-Path $stage 'package') -Force | Out-Null
 Copy-Item "$pkg\winvhci.sys", "$pkg\winvhci.inf", "$pkg\winvhci.cat" (Join-Path $stage 'package')
 Move-Item $cerPath (Join-Path $stage 'winvhci-test.cer') -Force
+
+# The installer travels with the package, so a release zip is self-contained and
+# the tree CI tests is the tree users download - which is what stops the
+# installer from being the one component nobody ever ran before shipping.
+# install-winvhci.ps1 finds vhci-devnode.ps1 beside itself, so both go in.
+Copy-Item (Join-Path $repo 'build\install-winvhci.ps1') $stage
+Copy-Item (Join-Path $repo 'build\ci\vhci-devnode.ps1') $stage
 
 $inf = Get-Content (Join-Path $stage 'package\winvhci.inf') -Raw
 $driverVer = if ($inf -match '(?m)^\s*DriverVer\s*=\s*(.+)$') { $Matches[1].Trim() } else { 'unknown' }
@@ -209,7 +258,12 @@ $driverVer = if ($inf -match '(?m)^\s*DriverVer\s*=\s*(.+)$') { $Matches[1].Trim
     sdkVersion      = $SdkVersion
     inf2catOs       = $osList
     certThumbprint  = $cert.Thumbprint
-    certSubject     = $CertSubject
+    # The certificate's own subject, not the -CertSubject parameter: with a PFX
+    # the parameter is not what signed anything, and this field is how a user
+    # checks that a download carries the signer they already trust.
+    certSubject     = $cert.Subject
+    certExpires     = $cert.NotAfter.ToString('yyyy-MM-dd')
+    certEphemeral   = [bool](-not $Pfx)
     hardwareId      = 'root\winvhci'
     childCompatId   = 'MS_BTHX_BTHMINI'
     sysSha256       = (Get-FileHash (Join-Path $stage 'package\winvhci.sys') -Algorithm SHA256).Hash

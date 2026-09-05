@@ -1,0 +1,291 @@
+# Build, verify and publish a release.
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# Releases are signed with a STABLE certificate held in repository secrets, not
+# with the throwaway certificate CI uses. install-winvhci.ps1 imports the signer
+# into the machine's Root and TrustedPublisher stores, so a per-release
+# certificate would ask every user to trust a new one on every upgrade and leave
+# the old ones behind. One certificate, trusted once.
+#
+# Secrets required:
+#   WINVHCI_TEST_PFX_B64        base64 of the PFX holding the signing key
+#   WINVHCI_TEST_PFX_PASSWORD   its password
+#
+# The public half is committed as build/winvhci-test.cer and ships inside every
+# package, which is what the installer trusts.
+#
+# Note this is still a TEST-SIGNED driver: it loads only on a machine with test
+# signing enabled, Secure Boot off and memory integrity off. Making it load on
+# an ordinary machine needs an EV certificate and attestation signing through
+# Partner Center, which is a separate track.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # For rehearsing the whole thing without publishing. Everything runs, and the
+  # publish job is skipped, so a broken signing secret is found before a tag is
+  # burned rather than after.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  WDK_VERSION: 10.0.28000.2526
+
+jobs:
+  package:
+    name: package ${{ matrix.platform }} ${{ matrix.configuration }}
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, ARM64]
+        # Release is what users install; Debug ships alongside it because
+        # KdPrint is #if DBG, so a bug report from a Release build carries no
+        # driver output at all.
+        configuration: [Release, Debug]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache the WDK
+        id: wdk-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: packages
+          key: wdk-${{ matrix.platform }}-${{ env.WDK_VERSION }}-${{ hashFiles('packages.config') }}
+
+      - name: Restore the WDK from NuGet
+        if: steps.wdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          [xml]$cfg = Get-Content packages.config
+          $ver  = ($cfg.packages.package | Select-Object -First 1).version
+          $arch = '${{ matrix.platform }}'.ToLower()
+          foreach ($id in @('Microsoft.Windows.SDK.CPP',
+                            "Microsoft.Windows.SDK.CPP.$arch",
+                            "Microsoft.Windows.WDK.$arch")) {
+            nuget install $id -Version $ver -OutputDirectory packages `
+                  -DependencyVersion Ignore -NonInteractive
+            if ($LASTEXITCODE -ne 0) { throw "nuget install $id failed ($LASTEXITCODE)" }
+          }
+
+      - name: Build and sign
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.WINVHCI_TEST_PFX_B64 }}
+          PFX_PASSWORD: ${{ secrets.WINVHCI_TEST_PFX_PASSWORD }}
+        run: |
+          if (-not $env:PFX_B64) {
+            throw 'WINVHCI_TEST_PFX_B64 is not set. A release must be signed by the stable certificate, so this fails rather than quietly producing a package signed by a throwaway one.'
+          }
+
+          # Into RUNNER_TEMP, never the workspace: nothing there can be picked up
+          # by a later glob or an artifact upload.
+          $pfx = Join-Path $env:RUNNER_TEMP 'winvhci-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+          try {
+            .\build\ci\build-package.ps1 `
+              -Platform ${{ matrix.platform }} `
+              -Configuration ${{ matrix.configuration }} `
+              -WdkVersion $env:WDK_VERSION `
+              -Pfx $pfx -PfxPassword $env:PFX_PASSWORD `
+              -OutDir out
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Check the signer is the committed certificate
+        shell: pwsh
+        run: |
+          # The .cer in the repository is what install-winvhci.ps1 trusts, and
+          # what users may already have imported. If the secret ever drifts from
+          # it, every install would fail with an untrusted publisher - and
+          # pnputil expresses that by hanging, not by erroring. Catch it here.
+          $expected = (Get-PfxCertificate 'build\winvhci-test.cer').Thumbprint
+          $info = Get-Content out\build-info.json -Raw | ConvertFrom-Json
+          Write-Host "committed cer : $expected"
+          Write-Host "package signer: $($info.certThumbprint)"
+          if ($info.certThumbprint -ne $expected) {
+            throw "the package was signed by $($info.certThumbprint), but build/winvhci-test.cer is $expected"
+          }
+          if ($info.certEphemeral) { throw 'the package was signed by an ephemeral certificate' }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.configuration }}
+          path: out/
+          if-no-files-found: error
+
+  # Install the package that is about to be published, with the certificate it
+  # is about to be published with, using the action a consumer would use. A
+  # release that does not install is the failure this catches, and it is exactly
+  # the one that is invisible until somebody downloads it.
+  verify:
+    name: verify ${{ matrix.platform }} on ${{ matrix.runner }}
+    needs: package
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            runner: windows-2025
+          - platform: ARM64
+            runner: windows-11-vs2026-arm
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ matrix.platform }}-Debug
+          path: pkg
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Bumble
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --no-deps bumble
+          python -m pip install --disable-pip-version-check typing_extensions pyee
+
+      - name: Install the signed package with the action
+        uses: ./actions/install
+        with:
+          package-path: pkg
+
+      - name: Drive the radio from Python
+        shell: powershell
+        run: |
+          python -m pip install --disable-pip-version-check ".\python[test]"
+          python -m pytest python\tests -v
+
+      - name: Uninstall cleanly
+        shell: powershell
+        run: |
+          # -Uninstall is part of the published interface and is otherwise never
+          # run by anything, which would make it the least tested script we ship.
+          .\pkg\install-winvhci.ps1 -Uninstall
+          if ($LASTEXITCODE -ne 0) { throw "uninstall exited $LASTEXITCODE" }
+
+  publish:
+    name: publish
+    needs: [package, verify]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+
+      - name: Assemble the release assets
+        id: assets
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p dist
+
+          # Each zip is the artifact tree unchanged - package/, the certificate,
+          # the installer and build-info.json - so what is published is byte for
+          # byte what the verify job installed.
+          for platform in x64 ARM64; do
+            arch=$(echo "$platform" | tr '[:upper:]' '[:lower:]')
+            for configuration in Release Debug; do
+              src="artifacts/release-${platform}-${configuration}"
+              [ -d "$src" ] || { echo "missing $src"; exit 1; }
+              if [ "$configuration" = "Release" ]; then
+                name="winvhci-${version}-${arch}.zip"
+              else
+                name="winvhci-${version}-${arch}-debug.zip"
+              fi
+              (cd "$src" && zip -qr "${GITHUB_WORKSPACE}/dist/${name}" .)
+              echo "packed ${name}"
+            done
+          done
+
+          cp build/winvhci-test.cer dist/winvhci-test.cer
+          (cd dist && sha256sum ./*.zip ./*.cer > SHA256SUMS.txt)
+          ls -l dist
+
+      - name: Write the release notes
+        run: |
+          set -euo pipefail
+          info=artifacts/release-x64-Release/build-info.json
+          driver_ver=$(python3 -c "import json;print(json.load(open('$info'))['driverVer'])")
+          thumbprint=$(python3 -c "import json;print(json.load(open('$info'))['certThumbprint'])")
+          subject=$(python3 -c "import json;print(json.load(open('$info'))['certSubject'])")
+
+          cat > notes.md <<NOTES
+          A virtual Bluetooth HCI controller for Windows. Userspace supplies the
+          controller behaviour; Windows sees a real local Bluetooth radio with
+          the whole in-box stack above it.
+
+          **This driver is test-signed.** It will not load on a Windows machine
+          in its default configuration. The installer checks each prerequisite
+          and refuses rather than half-installing:
+
+          - test signing on (\`bcdedit /set testsigning on\`, then reboot)
+          - Secure Boot **off** — Windows silently ignores test signing while it is on
+          - memory integrity (HVCI) off
+
+          ### Install
+
+          Download the zip for your architecture, unblock it, and run from an
+          elevated PowerShell:
+
+          \`\`\`powershell
+          .\\install-winvhci.ps1
+          \`\`\`
+
+          \`-Uninstall\` removes the device, the driver store entry and both
+          certificate entries. \`-AllowInteractiveUsers\` lets unelevated users
+          open the device on a development machine — note that whoever can open
+          it can inject arbitrary HCI into the local Bluetooth stack.
+
+          ### In CI
+
+          \`\`\`yaml
+          - uses: dlech/windows-vhci-driver/actions/install@${GITHUB_REF_NAME}
+            with:
+              version: ${GITHUB_REF_NAME}
+          \`\`\`
+
+          Runs on \`windows-2025\` and \`windows-11-vs2026-arm\`. Not
+          \`windows-2022\`: the driver loads, but the user-mode Bluetooth
+          services are absent.
+
+          ### This release
+
+          | | |
+          |---|---|
+          | DriverVer | \`${driver_ver}\` |
+          | Signer | \`${subject}\` |
+          | Thumbprint | \`${thumbprint}\` |
+
+          Both architectures were installed on a hosted runner from these exact
+          artifacts, and a Bumble controller drove the Windows Bluetooth stack
+          through them, before this release was published.
+          NOTES
+          sed -i 's/^          //' notes.md
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            dist/*

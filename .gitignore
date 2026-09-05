@@ -14,13 +14,20 @@ winvhci/Win32/
 *.recipe
 *.FileListAbsolute.txt
 
-# Driver binaries and signing artifacts. The test certificate is generated per
-# machine by the WDK's test-sign step; it is not shared and must never be a
-# committed secret.
+# Driver binaries and signing artifacts. Certificates built during a local or
+# CI build are per-machine and throwaway, and a PRIVATE key must never be
+# committed - hence *.pfx with no exception below, ever.
 *.sys
 *.cat
 *.cer
 *.pfx
+
+# The one exception: the PUBLIC half of the release signing certificate. It has
+# to be in the repository, because it is what install-winvhci.ps1 trusts and
+# what the release workflow checks the signed package against - a release signed
+# by anything else would make pnputil hang on an untrusted publisher. There is
+# no secret in a .cer; the private key lives only in repository secrets.
+!build/winvhci-test.cer
 
 # Third-party tools, fetched rather than vendored - but keep the note that says
 # where to fetch them from.
