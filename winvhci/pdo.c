@@ -46,12 +46,10 @@ Routine Description:
 
 --*/
 {
-    PWINVHCI_PDO_CONTEXT pdoCtx = WinVhciPdoGetContext(Device);
-
+    UNREFERENCED_PARAMETER(Device);
     UNREFERENCED_PARAMETER(ResourcesRaw);
     UNREFERENCED_PARAMETER(ResourcesTranslated);
 
-    WinVhciTraceUlong(pdoCtx->Fdo, L"WvPdoPrepareHw", 1);
     KdPrint(("winvhci: pdo prepare hardware\n"));
 
     return STATUS_SUCCESS;
@@ -63,11 +61,9 @@ WinVhciPdoEvtD0Entry(
     _In_ WDF_POWER_DEVICE_STATE PreviousState
     )
 {
-    PWINVHCI_PDO_CONTEXT pdoCtx = WinVhciPdoGetContext(Device);
-
+    UNREFERENCED_PARAMETER(Device);
     UNREFERENCED_PARAMETER(PreviousState);
 
-    WinVhciTraceUlong(pdoCtx->Fdo, L"WvPdoD0Entry", 1);
     KdPrint(("winvhci: pdo D0 entry\n"));
 
     return STATUS_SUCCESS;
@@ -103,8 +99,6 @@ Routine Description:
     // failed" are distinguishable rather than both looking like silence.
     //
     fdoCtx->PdoRequestCount++;
-    WinVhciTraceUlong(pdoCtx->Fdo, L"WvPdoRequests", fdoCtx->PdoRequestCount);
-    WinVhciTraceUlong(pdoCtx->Fdo, L"WvPdoLastIoctl", IoControlCode);
 
     WDF_REQUEST_FORWARD_OPTIONS_INIT(&options);
 

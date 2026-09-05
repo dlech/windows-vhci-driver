@@ -210,9 +210,6 @@ simulated link, and raw-byte Command Complete replies. All are in
   reaching the socket, so `Poll` never reports it readable. Closing that needs an inactivity
   timeout or a keepalive.
 
-- Decide what to do with the registry breadcrumbs: the `WvScoSupport` / `WvMaxScoChannels` knobs
-  earn their keep, the per-IOCTL trace writes are now redundant with DebugView.
-
 **Exit:** an M3 session survives Verifier and the abuse list without a bugcheck. **Met** — for
 every Verifier facility that this toolchain and this driver's allocation pattern actually make
 available.
@@ -226,9 +223,6 @@ available.
   in the evidence.
 - Narrow down which LE Supported States bits Windows actually requires; the working value is
   empirical.
-- Decide the fate of the registry breadcrumbs — the `WvScoSupport` / `WvMaxScoChannels` /
-  `WvFailAllocOneIn` knobs earn their keep, the per-IOCTL trace writes are redundant now that
-  DebugView works.
 - A `pip`-installable client, and a Bumble transport that speaks to `\\.\WinVhci` directly so
   the bridge is not needed.
 - BR/EDR beyond initialisation. The dual-mode LMP mask advertises capabilities Bumble cannot
@@ -246,7 +240,7 @@ revising a public pull request as this project goes on learning things.
 
 ```
 winvhci/      driver.c    DriverEntry, EvtDeviceAdd
-              fdo.c       BTHX contract, queues, rendezvous, registry breadcrumbs
+              fdo.c       BTHX contract, queues, rendezvous, registry knobs
               pdo.c       the radio PDO and IOCTL forwarding
               user.c      \\.\WinVhci - read/write, H4 framing, control packet
               winvhci.h   shared declarations and measured constants

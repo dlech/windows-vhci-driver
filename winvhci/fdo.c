@@ -34,68 +34,22 @@ Environment:
 #define HCI_OPCODE_RESET 0x0C03
 
 //
-// Breadcrumbs.
-//
-// Durable state that outlives a capture session, recorded under a registry key
-// any SSH session can read back:
+// Tuning knobs live under an absolute registry path:
 //
 //   HKLM\SOFTWARE\winvhci
 //
-// An absolute path, deliberately, rather than the device's own key: an earlier
-// version used WdfDeviceOpenRegistryKey(PLUGPLAY_REGKEY_DEVICE), which wrote
+// Absolute, deliberately, rather than the device's own key. An earlier version
+// used WdfDeviceOpenRegistryKey(PLUGPLAY_REGKEY_DEVICE) and it read and wrote
 // nothing at all - not even from EvtDeviceAdd, which certainly runs. The
-// devnode's "Device Parameters" key is not reliably available that early, and a
-// tracing mechanism that fails silently in the exact conditions you want to
-// trace is worse than none. This path always exists or can be created.
+// devnode's "Device Parameters" key is not reliably available that early. This
+// path always exists or can be created.
 //
-// KdPrint via DebugView is the better channel for a live transcript (see
-// docs/development.md), so these breadcrumbs are for state that must survive a
-// crash or be readable long after the fact.
+// This key used to carry write-side breadcrumbs too - a counter and a
+// last-value per request - from before DebugView was working. They have been
+// removed: they cost a registry write per request, which is far too expensive
+// once the data path carries real traffic, and KdPrint gives a better
+// transcript with ordering and timestamps. See docs/development.md.
 //
-// Diagnostic scaffolding for bring-up, not a permanent logging design: it costs
-// a registry write per request, far too expensive once the data path carries
-// real traffic.
-//
-VOID
-WinVhciTraceUlong(
-    _In_ WDFDEVICE Device,
-    _In_ PCWSTR    Name,
-    _In_ ULONG     Value
-    )
-{
-    WDFKEY         key;
-    UNICODE_STRING name;
-    NTSTATUS       status;
-
-    DECLARE_CONST_UNICODE_STRING(path, L"\\Registry\\Machine\\SOFTWARE\\winvhci");
-
-    UNREFERENCED_PARAMETER(Device);
-
-    //
-    // Registry access requires PASSIVE_LEVEL. Silently skipping at raised IRQL
-    // is correct here: losing a breadcrumb must never change driver behaviour.
-    //
-    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
-        return;
-    }
-
-    status = WdfRegistryCreateKey(NULL,
-                                  &path,
-                                  KEY_WRITE,
-                                  REG_OPTION_NON_VOLATILE,
-                                  NULL,
-                                  WDF_NO_OBJECT_ATTRIBUTES,
-                                  &key);
-    if (!NT_SUCCESS(status)) {
-        return;
-    }
-
-    RtlInitUnicodeString(&name, Name);
-    (VOID)WdfRegistryAssignULong(key, &name, Value);
-
-    WdfRegistryClose(key);
-}
-
 _Success_(return != FALSE)
 static BOOLEAN
 WinVhciReadUlong(
@@ -403,16 +357,13 @@ WinVhciBthxDispatch(
     }
 
     //
-    // Record that a request arrived at all, before deciding anything about it.
+    // Count that a request arrived at all, before deciding anything about it.
     // "Did BthMini ever call us?" is the first question to answer, and a
-    // breadcrumb written only on the success paths cannot answer it.
+    // counter bumped only on the success paths cannot answer it.
     //
     WdfSpinLockAcquire(ctx->Lock);
     ctx->IoctlCount++;
     WdfSpinLockRelease(ctx->Lock);
-
-    WinVhciTraceUlong(device, L"WvIoctlCount", ctx->IoctlCount);
-    WinVhciTraceUlong(device, L"WvLastIoctl",  IoControlCode);
 
     switch (IoControlCode) {
 
@@ -429,8 +380,6 @@ WinVhciBthxDispatch(
         info   = sizeof(BTHX_VERSION);
         status = STATUS_SUCCESS;
 
-        WinVhciTraceUlong(device, L"WvGetVersion", Microsoft_BTHX_DDI_Version.Version);
-
         KdPrint(("winvhci: GET_VERSION -> %u\n", Microsoft_BTHX_DDI_Version.Version));
         break;
 
@@ -445,8 +394,6 @@ WinVhciBthxDispatch(
 
         ctx->BthxVersion = ((PBTHX_VERSION)inBuf)->Version;
         status = STATUS_SUCCESS;
-
-        WinVhciTraceUlong(device, L"WvSetVersion", ctx->BthxVersion);
 
         KdPrint(("winvhci: SET_VERSION <- %u\n", ctx->BthxVersion));
         break;
@@ -503,8 +450,6 @@ WinVhciBthxDispatch(
         info   = sizeof(BTHX_CAPABILITIES);
         status = STATUS_SUCCESS;
 
-        WinVhciTraceUlong(device, L"WvQueryCapsSco", scoSupport);
-
         KdPrint(("winvhci: QUERY_CAPABILITIES -> maxAclIn %u sco %u chans %u\n",
                  WINVHCI_MAX_ACL_TRANSFER_IN, scoSupport, maxSco));
         break;
@@ -524,9 +469,6 @@ WinVhciBthxDispatch(
         WdfSpinLockAcquire(ctx->Lock);
         ctx->WriteHciCount++;
         WdfSpinLockRelease(ctx->Lock);
-
-        WinVhciTraceUlong(device, L"WvWriteHci",  ctx->WriteHciCount);
-        WinVhciTraceUlong(device, L"WvWriteType", w->Type);
 
         KdPrint(("winvhci: WRITE_HCI type 0x%02x len %u (#%u)\n",
                  w->Type, w->DataLen, ctx->WriteHciCount));
@@ -579,7 +521,6 @@ WinVhciBthxDispatch(
         if ((PUCHAR)outBuf != (PUCHAR)inBuf + WINVHCI_READ_TYPE_WORD_SIZE) {
             KdPrint(("winvhci: READ_HCI UNEXPECTED LAYOUT: out %p != in %p + %u\n",
                      outBuf, inBuf, (ULONG)WINVHCI_READ_TYPE_WORD_SIZE));
-            WinVhciTraceUlong(device, L"WvReadLayoutBad", 1);
             status = STATUS_INVALID_DEVICE_REQUEST;
             break;
         }
@@ -618,7 +559,6 @@ WinVhciBthxDispatch(
             //
             KdPrint(("winvhci: READ_HCI unexpected requested type %u, "
                      "falling back to capacity\n", r->DataLen));
-            WinVhciTraceUlong(device, L"WvReadOddType", r->DataLen);
             target = (capacity >= WINVHCI_MAX_ACL_TRANSFER_IN) ? ctx->ReadDataQueue
                                                              : ctx->ReadEventQueue;
             break;
@@ -627,7 +567,6 @@ WinVhciBthxDispatch(
         if ((target == ctx->ReadDataQueue) != (capacity >= WINVHCI_MAX_ACL_TRANSFER_IN)) {
             KdPrint(("winvhci: READ_HCI type/capacity DISAGREE (type %u capacity %u)\n",
                      r->DataLen, capacity));
-            WinVhciTraceUlong(device, L"WvReadMismatch", capacity);
         }
 
         KdPrint(("winvhci: READ_HCI request type %u capacity %u -> %s queue\n",
@@ -667,9 +606,6 @@ WinVhciBthxDispatch(
         }
         WdfSpinLockRelease(ctx->Lock);
 
-        WinVhciTraceUlong(device, L"WvReadEvent", ctx->PendedEventReads);
-        WinVhciTraceUlong(device, L"WvReadAcl",   ctx->PendedDataReads);
-
         KdPrint(("winvhci: READ_HCI pended (evt %u, acl %u)\n",
                  ctx->PendedEventReads, ctx->PendedDataReads));
 
@@ -680,7 +616,6 @@ WinVhciBthxDispatch(
     }
 
     default:
-        WinVhciTraceUlong(device, L"WvUnknownIoctl", IoControlCode);
         KdPrint(("winvhci: unhandled ioctl 0x%08x\n", IoControlCode));
         break;
     }
@@ -691,7 +626,6 @@ WinVhciBthxDispatch(
     // looks identical from outside whether we returned it or BthMini decided
     // it on its own.
     //
-    WinVhciTraceUlong(device, L"WvLastStatus", (ULONG)status);
 
     WdfRequestCompleteWithInformation(Request, status, info);
 }

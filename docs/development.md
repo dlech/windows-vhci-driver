@@ -159,15 +159,28 @@ The CLI is explicitly designed for scripted use (`--duration`, `--max-lines`, `-
 `--no-banner`, `--format csv`, `--status`); read
 <https://learn.microsoft.com/sysinternals/downloads/debugview> before improvising.
 
-### Registry breadcrumbs
+### Registry knobs
 
-The driver records counters and last-seen values under `HKLM\SOFTWARE\winvhci`
-(`WinVhciTraceUlong` in `fdo.c`). This is bring-up scaffolding rather than a logging design, but
-it is still the only channel for state that must survive a crash or be read long after the
-fact, and it is how the `ScoSupport` question was settled cheaply.
+`HKLM\SOFTWARE\winvhci` holds values the driver *reads* at device add:
 
-Note that `WdfDeviceOpenRegistryKey(PLUGPLAY_REGKEY_DEVICE)` wrote nothing here, even from
-`EvtDeviceAdd`. The code uses an absolute path — `\Registry\Machine\SOFTWARE\winvhci` — instead.
+| Value | Effect |
+| --- | --- |
+| `WvScoSupport` | `BTHX_SCO_SUPPORT` to report — 0 None, 1 HCI, 2 HCIBypass |
+| `WvMaxScoChannels` | `MaxScoChannels` to report |
+| `WvFailAllocOneIn` | fail every Nth packet allocation; 0 (default) disables |
+
+These earn their keep: a registry edit and a device restart, rather than a
+rebuild-sign-package-install cycle, is what made the `ScoSupport` question cheap to settle.
+
+`WdfDeviceOpenRegistryKey(PLUGPLAY_REGKEY_DEVICE)` reads and writes *nothing* here, even from
+`EvtDeviceAdd` — the devnode's "Device Parameters" key is not reliably available that early — so
+the code uses the absolute path `\Registry\Machine\SOFTWARE\winvhci` instead.
+
+**The write-side breadcrumbs are gone.** During bring-up the driver also recorded a counter and
+a last-seen value per request under the same key, because `KdPrint` output could not yet be
+captured. They cost a registry write per request, which is far too expensive once the data path
+carries real traffic, and DebugView gives a better transcript with ordering and timestamps. If
+you need state that survives a crash, prefer a crash dump.
 
 ### Driver Verifier
 

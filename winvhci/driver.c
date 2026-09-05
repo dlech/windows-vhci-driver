@@ -136,13 +136,6 @@ Routine Description:
         return status;
     }
 
-    //
-    // First breadcrumb, written from a callback that certainly runs. If this
-    // value is absent from the device key, the tracing mechanism itself is
-    // broken and no conclusion may be drawn from the absence of the others.
-    //
-    WinVhciTraceUlong(device, L"WvDeviceAdd", 1);
-
     status = WinVhciFdoCreateQueues(device);
     if (!NT_SUCCESS(status)) {
         return status;

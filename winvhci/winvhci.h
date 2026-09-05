@@ -242,17 +242,6 @@ EVT_WDF_OBJECT_CONTEXT_CLEANUP     WinVhciEvtDriverContextCleanup;
 //
 // fdo.c
 //
-//
-// Bring-up breadcrumb: records a value under the FDO's device key. See the
-// comment in fdo.c - this is scaffolding, not the eventual logging design.
-//
-VOID
-WinVhciTraceUlong(
-    _In_ WDFDEVICE Device,
-    _In_ PCWSTR    Name,
-    _In_ ULONG     Value
-    );
-
 NTSTATUS
 WinVhciFdoCreateQueues(
     _In_ WDFDEVICE Device

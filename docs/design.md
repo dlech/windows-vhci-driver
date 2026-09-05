@@ -234,8 +234,8 @@ Mechanics:
   `ReadFile` blocks indefinitely once the stack goes quiet, so a bounded run never terminates
   and has to be killed — which also loses its buffered output.
 
-There is no statistics IOCTL. Counters live in the FDO context and are exposed through the
-registry breadcrumbs described in [development.md](development.md).
+There is no statistics IOCTL. Counters live in the FDO context and reach the outside world
+through `KdPrint`, read with DebugView — see [development.md](development.md).
 
 ---
 
