@@ -50,3 +50,10 @@ bumble-venv/
 .venv/
 __pycache__/
 .mypy_cache/
+
+# NuGet WDK/SDK restored by CI (see packages.config)
+packages/
+
+# Staged CI artifacts
+out/
+artifacts/
