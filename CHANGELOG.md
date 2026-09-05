@@ -15,6 +15,28 @@ and the set of supported runner images.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-09-05
+
+### Fixed
+
+- `apply_dual_mode` broke bring-up entirely against Bumble 0.0.226. It set
+  `lmp_features` to an integer, which up to that version *is* the byte mask
+  Bumble slices when answering `Read_Local_Supported_Features`. Bumble raised
+  `TypeError: 'int' object is not subscriptable`, logged it and carried on, so
+  the controller simply never replied and Windows never finished bringing the
+  radio up. The visible symptom was a timeout waiting for a Bluetooth adapter,
+  several layers from the cause.
+
+  This is the same version-sensitivity as the `supported_commands` fix in 1.0.1,
+  one attribute over. `le_states` was checked and is `bytes` in both versions,
+  so all three overrides are now accounted for.
+
+- The unit tests now ask the controller the questions Windows asks and read the
+  replies, rather than asserting on the attributes. `lmp_features ==
+  DUAL_MODE_LMP_FEATURES` passed against every Bumble version while the feature
+  was completely broken, because assigning an attribute always works — it is
+  Bumble's own use of it that fails.
+
 ## [1.0.1] - 2026-09-05
 
 ### Fixed
@@ -82,6 +104,7 @@ First release.
   reboot — so the teardown abuse suite runs unverified in CI and under Verifier
   only on a developer machine.
 
-[Unreleased]: https://github.com/dlech/windows-vhci-driver/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/dlech/windows-vhci-driver/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/dlech/windows-vhci-driver/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/dlech/windows-vhci-driver/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/dlech/windows-vhci-driver/releases/tag/v1.0.0

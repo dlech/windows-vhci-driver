@@ -90,6 +90,29 @@ def test_supported_commands_has_the_same_shape_as_bumbles():
     )
 
 
+@pytest.mark.parametrize('opcode', EXPECTED_EXTRA_COMMANDS)
+@pytest.mark.asyncio
+async def test_read_local_supported_commands_advertises_them(opcode: int):
+    """The same wire-path check for supported_commands.
+
+    The type assertion above would catch a shape mismatch, but only this proves
+    Bumble can actually turn the value into a reply - which is the step that
+    broke for lmp_features while a value-equality assertion stayed green.
+    """
+    controller = WindowsCompatController('test', link=WindowsCompatLink())
+    reply = controller.on_hci_read_local_supported_commands_command(
+        hci.HCI_Read_Local_Supported_Commands_Command()
+    )
+    assert reply is not None
+    assert reply.status == hci.HCI_ErrorCode.SUCCESS
+
+    advertised = int.from_bytes(reply.supported_commands, 'little')
+    mask = hci.HCI_SUPPORTED_COMMANDS_MASKS[opcode]
+    assert advertised & mask, (
+        f'opcode {opcode:#06x} is not in the reply, so Windows will never send it'
+    )
+
+
 def test_le_states_is_the_value_windows_needs():
     # Bumble's own value makes Windows abandon LE bring-up; this is the
     # empirical value that gets it to a fully capable adapter.
@@ -97,17 +120,39 @@ def test_le_states_is_the_value_windows_needs():
 
 
 @pytest.mark.asyncio
-async def test_apply_dual_mode_clears_br_edr_not_supported():
-    # async because Controller.__init__ creates a future, so it needs a running
-    # loop even though nothing here awaits.
-    controller = Controller('test', link=WindowsCompatLink())
-    apply_dual_mode(controller)
-    assert controller.lmp_features == DUAL_MODE_LMP_FEATURES
+async def test_apply_dual_mode_answers_read_local_supported_features():
+    """Ask the controller the question Windows asks, and read the reply.
 
-    # Octet 4 bit 5 is BR_EDR_NOT_SUPPORTED, and bit 6 is LE_SUPPORTED.
-    # Windows stops dead after Read_Local_Supported_Features unless the
-    # controller looks dual-mode.
-    octet4 = (DUAL_MODE_LMP_FEATURES >> 32) & 0xFF
+    Deliberately not `assert controller.lmp_features == DUAL_MODE_LMP_FEATURES`.
+    That assertion passed against every Bumble version while the feature was
+    completely broken on 0.0.226, because assigning the attribute always works -
+    it is Bumble's own use of it that fails. Up to 0.0.226 lmp_features IS the
+    byte mask and gets sliced; an integer there raises
+
+        TypeError: 'int' object is not subscriptable
+
+    inside Bumble, which logs and swallows it, so the controller never answers
+    and Windows waits forever. Going through the handler is what makes that
+    visible here rather than in a consumer's test suite.
+
+    async because Controller.__init__ creates a future, so it needs a running
+    loop even though nothing here awaits.
+    """
+    controller = WindowsCompatController('test', link=WindowsCompatLink())
+    apply_dual_mode(controller)
+
+    reply = controller.on_hci_read_local_supported_features_command(
+        hci.HCI_Read_Local_Supported_Features_Command()
+    )
+    assert reply is not None
+    assert reply.status == hci.HCI_ErrorCode.SUCCESS
+
+    features = int.from_bytes(reply.lmp_features, 'little')
+    assert features == DUAL_MODE_LMP_FEATURES & ((1 << 64) - 1)
+
+    # Octet 4 bit 5 is BR_EDR_NOT_SUPPORTED and bit 6 is LE_SUPPORTED. Windows
+    # stops dead right after this command unless the controller looks dual-mode.
+    octet4 = (features >> 32) & 0xFF
     assert not octet4 & (1 << 5), 'BR_EDR_NOT_SUPPORTED must be clear'
     assert octet4 & (1 << 6), 'LE_SUPPORTED must be set'
 
