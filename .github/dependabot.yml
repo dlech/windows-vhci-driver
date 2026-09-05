@@ -1,0 +1,32 @@
+# Keep the SHA-pinned actions current.
+#
+# The workflows pin actions by commit SHA rather than by tag, because a tag is a
+# mutable reference: whoever controls the action's repository can move it after
+# review. A SHA cannot be moved. The cost of that is the pins go stale silently,
+# which is what this file is for - Dependabot reads the `# vX.Y.Z` comment
+# beside each SHA, resolves the newer release, and updates both together.
+#
+# Read the resulting pull requests rather than merging them on sight. A major
+# bump here is a code change, not a version bump, and actions do ship behaviour
+# changes in majors: actions/download-artifact@v8 stopped unconditionally
+# unzipping downloads and made a hash mismatch a hard error, either of which
+# would have broken the smoke job's assumption that its artifact arrives as an
+# unpacked tree.
+
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # One pull request for the lot, rather than one per action. There are five,
+    # and they move together often enough that separate PRs are mostly noise.
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
