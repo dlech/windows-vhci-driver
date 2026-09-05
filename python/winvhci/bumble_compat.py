@@ -452,5 +452,25 @@ def apply_dual_mode(controller: Controller) -> None:
     This is a diagnostic override, not a claim Bumble can honour: it advertises
     BR/EDR features Bumble does not implement, so BR/EDR operations will fail
     later. It is here to isolate WHY the stack stops.
+
+    Bumble changed this attribute's representation, as it did
+    ``supported_commands``. Up to 0.0.226 ``lmp_features`` IS the mask, and the
+    controller slices it when answering Read_Local_Supported_Features; from
+    0.0.234 it is an integer and the bytes are derived from it.
+
+    Assigning an integer to the older one does not fail here. It fails later,
+    inside Bumble, while answering the command:
+
+        TypeError: 'int' object is not subscriptable
+
+    which Bumble logs and swallows, so the controller simply never replies and
+    Windows never finishes bringing the radio up. The visible symptom is a
+    timeout waiting for an adapter, several layers away from the cause.
     """
-    controller.lmp_features = DUAL_MODE_LMP_FEATURES
+    current = controller.lmp_features
+    if isinstance(current, (bytes, bytearray)):
+        controller.lmp_features = DUAL_MODE_LMP_FEATURES.to_bytes(
+            len(current), 'little'
+        )
+    else:
+        controller.lmp_features = DUAL_MODE_LMP_FEATURES
