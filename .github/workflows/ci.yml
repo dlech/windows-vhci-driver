@@ -49,7 +49,7 @@ jobs:
         configuration: [Debug, Release]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Restoring the WDK dominated the job: 110s of a 152s build. Two changes
       # cut it. The packages are cached across runs, and each leg downloads only
@@ -58,7 +58,7 @@ jobs:
       # architecture's SDK or WDK.
       - name: Cache the WDK
         id: wdk-cache
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: packages
           key: wdk-${{ matrix.platform }}-${{ env.WDK_VERSION }}-${{ hashFiles('packages.config') }}
@@ -97,7 +97,7 @@ jobs:
             -WdkVersion $env:WDK_VERSION `
             -OutDir out
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: winvhci-${{ matrix.platform }}-${{ matrix.configuration }}
           path: out/
@@ -106,7 +106,7 @@ jobs:
       # The binlog is the only practical way to see which of the WDK's
       # Exists()-guarded imports actually resolved, which is the failure mode
       # most likely to bite when the toolchain moves.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
           name: buildlog-${{ matrix.platform }}-${{ matrix.configuration }}
@@ -127,7 +127,7 @@ jobs:
             runner: windows-2025
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Debug, not Release: KdPrint is #if DBG, so a Release load failure would
       # be silent just when the output is most needed.
@@ -137,12 +137,12 @@ jobs:
       # to support direct uploads - and this job depends on the artifact
       # arriving as an unpacked tree at pkg\package\. v7 is already on Node 24,
       # so it clears the deprecation without taking that change on.
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: winvhci-${{ matrix.platform }}-Debug
           path: pkg
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         id: py
         with:
           python-version: '3.12'
@@ -187,7 +187,7 @@ jobs:
           # which is what identifies the missing handler.
           Copy-Item bumble.*.log diag\ -ErrorAction SilentlyContinue
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: smoke-diag-${{ matrix.platform }}
