@@ -12,6 +12,24 @@ the supported runner images.
 
 ## [Unreleased]
 
+### Changed
+
+- The driver no longer drops packets when a backlog is full. Userspace writes
+  are pended for backpressure; the stack-to-userspace direction, whose producer
+  cannot be told to wait, is unbounded.
+
+### Added
+
+- `IOCTL_WINVHCI_GET_STATS`, exposed as `VhciDevice.stats()` and
+  `vhcibridge.ps1 -Stats`, so packet loss is measurable rather than invisible.
+- `tools/test-backpressure.ps1`, which proves writes pend and none are lost.
+
+### Fixed
+
+- `vhci-io.ps1` ignored its own write timeout and could block forever.
+- `vhcibridge.ps1` mis-reported a burst larger than its 8 KB reassembly buffer
+  as a malformed stream.
+
 ## [1.0.2] - 2026-09-05
 
 ### Fixed

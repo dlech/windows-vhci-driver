@@ -106,10 +106,78 @@ Environment:
 #define WINVHCI_MAX_H4_PACKET (1 + WINVHCI_MAX_BODY)
 
 //
-// Backlog bound. A virtual controller that blocks the host stack is worse than
-// one that loses a packet, so overflow drops and counts rather than waits.
+// Backlog policy. The two directions are NOT symmetric, because the producer
+// differs and only one of them can be told to wait.
+//
+// userspace -> stack: BACKPRESSURE. The producer is a userspace simulator
+//   holding \\.\WinVhci, so its WRITE can be pended until the stack drains a
+//   slot. That is honest - the writer learns the controller is behind - and it
+//   is also the only safe answer, because an unbounded queue fed by userspace
+//   is a non-paged pool exhaustion primitive available to anyone who can open
+//   the device. WINVHCI_MAX_BACKLOG is the depth at which writes start waiting.
+//
+// stack -> userspace: UNBOUNDED. The producer is BthPort, which cannot be told
+//   to wait: the packets are HCI commands and ACL data it has already handed
+//   off, and discarding one silently breaks bring-up in a way nothing can
+//   recover from or even report. So this direction is never bounded, and never
+//   drops while a client is attached. It drops only when NO client holds the
+//   device, where the alternative is an unbounded list nobody will ever read.
+//
+// This replaced a single bound of 64 on both directions, where overflow dropped
+// and counted. The count was unreadable from userspace, so the loss was
+// invisible: a discarded advertising report just looked like a device that
+// would not be discovered.
 //
 #define WINVHCI_MAX_BACKLOG 64
+
+//
+// Statistics, readable from userspace so a test can assert the driver lost
+// nothing rather than inferring it from behaviour.
+//
+//     DeviceIoControl(h, IOCTL_WINVHCI_GET_STATS, NULL, 0,
+//                     &stats, sizeof(stats), &returned, NULL);
+//
+#define IOCTL_WINVHCI_GET_STATS \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+typedef struct _WINVHCI_STATS {
+    ULONG Size;                 // sizeof(WINVHCI_STATS), for versioning
+
+    //
+    // Packets discarded. Any non-zero value is a defect or a client that went
+    // away mid-flight; nothing in normal operation should increment these.
+    //
+    ULONG DropsNoClient;        // stack -> userspace with no handle open
+    ULONG DropsAllocFailed;     // ExAllocatePool2 returned NULL
+
+    //
+    // Current and peak queue depths. The peaks are what say whether
+    // WINVHCI_MAX_BACKLOG is anywhere near being reached in practice.
+    //
+    ULONG HostToCtrlCount;
+    ULONG HostToCtrlPeak;
+    ULONG PendingEventCount;
+    ULONG PendingEventPeak;
+    ULONG PendingDataCount;
+    ULONG PendingDataPeak;
+
+    //
+    // Totals moved in each direction. These are the denominators: without
+    // them a flat WritesPended is ambiguous between "userspace sent nothing"
+    // and "userspace sent plenty and the stack kept up", which is not a
+    // distinction a test should have to guess at.
+    //
+    ULONG WritesTotal;          // H4 packets accepted from userspace
+    ULONG QueuedToUserTotal;    // packets queued stack -> userspace
+
+    //
+    // How many userspace writes have been pended for backpressure, and how
+    // many are waiting now. A rising total with a healthy stack is normal;
+    // a permanently non-zero Waiting means the stack stopped draining.
+    //
+    ULONG WritesPended;
+    ULONG WritesWaiting;
+} WINVHCI_STATS, *PWINVHCI_STATS;
 
 #define WINVHCI_POOL_TAG 'ihvW'
 
@@ -152,16 +220,48 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     WDFFILEOBJECT Owner;            // the one open handle, or NULL
 
     //
+    // Userspace writes pended for backpressure, waiting for the stack to drain
+    // a slot off PendingEventList or PendingDataList. Manual dispatch: nothing
+    // completes these but WinVhciDrainWriteWaiters.
+    //
+    WDFQUEUE      WriteWaitQueue;
+
+    //
     // Backlogs, for whichever side of a rendezvous arrives first.
     //
-    LIST_ENTRY  HostToCtrlList;     // stack -> userspace
+    LIST_ENTRY  HostToCtrlList;     // stack -> userspace, UNBOUNDED
     LIST_ENTRY  PendingEventList;   // userspace -> stack, events
     LIST_ENTRY  PendingDataList;    // userspace -> stack, ACL
 
     ULONG       HostToCtrlCount;
     ULONG       PendingEventCount;
     ULONG       PendingDataCount;
-    ULONG       DropCount;
+
+    //
+    // Peaks, so a test can see how close the bounded direction came to
+    // blocking rather than only whether it did.
+    //
+    ULONG       HostToCtrlPeak;
+    ULONG       PendingEventPeak;
+    ULONG       PendingDataPeak;
+
+    //
+    // Losses, split by cause because they mean completely different things: a
+    // client that vanished mid-flight is expected, a failed allocation is not.
+    // Neither should ever be non-zero because a queue was full - that is what
+    // backpressure and the unbounded direction exist to prevent.
+    //
+    ULONG       DropsNoClient;
+    ULONG       DropsAllocFailed;
+
+    //
+    // Totals, so the counters above have a denominator.
+    //
+    ULONG       WritesTotal;        // H4 packets accepted from userspace
+    ULONG       QueuedToUserTotal;  // packets queued stack -> userspace
+
+    ULONG       WritesPended;       // cumulative
+    ULONG       WritesWaiting;      // currently on WriteWaitQueue
 
     BOOLEAN     RadioPresent;
     ULONG       NextRadioId;
@@ -300,10 +400,21 @@ WinVhciPurgeBacklogs(
     _In_ PWINVHCI_FDO_CONTEXT Ctx
     );
 
-EVT_WDF_DEVICE_FILE_CREATE WinVhciEvtDeviceFileCreate;
-EVT_WDF_FILE_CLOSE         WinVhciEvtFileClose;
-EVT_WDF_IO_QUEUE_IO_READ   WinVhciEvtIoRead;
-EVT_WDF_IO_QUEUE_IO_WRITE  WinVhciEvtIoWrite;
+//
+// Release one userspace write that was pended for backpressure. Called after a
+// slot is freed on the bounded userspace -> stack direction, with the FDO lock
+// NOT held.
+//
+VOID
+WinVhciDrainWriteWaiters(
+    _In_ PWINVHCI_FDO_CONTEXT Ctx
+    );
+
+EVT_WDF_DEVICE_FILE_CREATE      WinVhciEvtDeviceFileCreate;
+EVT_WDF_FILE_CLOSE              WinVhciEvtFileClose;
+EVT_WDF_IO_QUEUE_IO_READ        WinVhciEvtIoRead;
+EVT_WDF_IO_QUEUE_IO_WRITE       WinVhciEvtIoWrite;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL WinVhciEvtIoDeviceControl;
 
 //
 // pdo.c

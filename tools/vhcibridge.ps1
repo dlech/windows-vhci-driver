@@ -15,6 +15,7 @@
 #
 #   .\vhcibridge.ps1 -Port 6402
 #   .\vhcibridge.ps1 -RemoteHost 10.0.2.2 -Port 6402 -Seconds 60
+#   .\vhcibridge.ps1 -Stats 5            # ...reporting the driver's counters
 #
 # The host default is QEMU's slirp gateway, so an emulator running on the VM
 # host is reachable from inside the guest without any extra networking.
@@ -24,7 +25,12 @@ param(
     [int]    $Port       = 6402,
     [int]    $Seconds    = 0,            # 0 = until Ctrl+C
     [string] $Device     = '\\.\WinVhci',
-    [switch] $Trace
+    [switch] $Trace,
+
+    # Report IOCTL_WINVHCI_GET_STATS every this many seconds, and once more at
+    # exit. The bridge is the only process that can: \\.\WinVhci is exclusive,
+    # so nothing else can open a handle to ask.
+    [int]    $Stats      = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,9 +67,23 @@ try {
     $acc    = New-Object byte[] 8192      # reassembly for the socket direction
     $accLen = 0
 
+    # Frame counts, so a stats line can distinguish "nothing arrived" from
+    # "everything arrived and the driver absorbed it". Without them a flat
+    # WritesPended is ambiguous, which cost a whole test run to work out.
+    $toController = 0
+    $toDriver     = 0
+
     $deadline = if ($Seconds -gt 0) { (Get-Date).AddSeconds($Seconds) } else { [DateTime]::MaxValue }
+    $nextStats = if ($Stats -gt 0) { (Get-Date).AddSeconds($Stats) } else { [DateTime]::MaxValue }
 
     while ((Get-Date) -lt $deadline -and $tcp.Connected) {
+
+        if ((Get-Date) -ge $nextStats) {
+            Write-Host ("stats at {0}" -f (Get-Date -Format HH:mm:ss)) -ForegroundColor Cyan
+            Write-Host ("   bridge       ->controller $toController   ->driver $toDriver")
+            Format-VhciStats ([VhciIo]::GetStats()) | ForEach-Object { Write-Host $_ }
+            $nextStats = (Get-Date).AddSeconds($Stats)
+        }
 
         # --- has the link died under us? ---------------------------------
         #
@@ -104,36 +124,76 @@ try {
                 Write-Frame '->' $devBuf $n
                 $stream.Write($devBuf, 0, $n)
                 $stream.Flush()
+                $toController++
             }
         }
 
         # --- controller -> Windows stack ---------------------------------
-        # TCP is a stream: accumulate, then hand the driver whole packets, one
-        # WriteFile per packet.
-        while ($stream.DataAvailable) {
-            $got = $stream.Read($netBuf, 0, $netBuf.Length)
-            if ($got -le 0) { break }
-            if ($accLen + $got -gt $acc.Length) {
-                throw 'reassembly buffer overflow - controller sent a malformed stream'
+        # TCP is a stream, so this accumulates bytes and hands the driver whole
+        # packets, one WriteFile per packet.
+        #
+        # Reading and draining are interleaved, and the read is capped at the
+        # free space. The first version read everything available before
+        # parsing any of it and treated a full accumulator as a protocol error:
+        #
+        #     throw 'reassembly buffer overflow - controller sent a malformed stream'
+        #
+        # That diagnosis was wrong, and the bug it hid was real. A burst of
+        # events - a flood of advertising reports, or any busy moment - puts far
+        # more than 8 KB in the socket at once, entirely well-formed. The
+        # accumulator only ever needs to hold ONE partial frame; anything more
+        # is buffering that TCP is already doing.
+        #
+        # The inner loop matters too. Going back around the outer loop for each
+        # 8 KB would pay another 50 ms device-read timeout per chunk, which
+        # throttles this direction to a crawl exactly when it is busiest.
+        do {
+            $progress = $false
+
+            while ($stream.DataAvailable -and $accLen -lt $acc.Length) {
+                $want = [Math]::Min($acc.Length - $accLen, $netBuf.Length)
+                $got = $stream.Read($netBuf, 0, $want)
+                if ($got -le 0) { break }
+                [Array]::Copy($netBuf, 0, $acc, $accLen, $got)
+                $accLen += $got
+                $progress = $true
             }
-            [Array]::Copy($netBuf, 0, $acc, $accLen, $got)
-            $accLen += $got
-        }
 
-        while ($accLen -gt 0) {
-            $frameLen = Get-H4FrameLength $acc $accLen
-            if ($frameLen -eq 0) { break }        # need more bytes
+            while ($accLen -gt 0) {
+                $frameLen = Get-H4FrameLength $acc $accLen
+                if ($frameLen -eq 0) {
+                    # A frame that cannot fit is the only genuine framing error
+                    # left: the longest H4 packet the driver accepts is 1026
+                    # bytes, so a full accumulator with no complete frame in it
+                    # means the stream is not H4.
+                    if ($accLen -eq $acc.Length) {
+                        throw ("no complete H4 frame in $accLen buffered bytes " +
+                               '- the controller is not speaking H4')
+                    }
+                    break                          # need more bytes
+                }
 
-            $frame = New-Object byte[] $frameLen
-            [Array]::Copy($acc, 0, $frame, 0, $frameLen)
-            Write-Frame '<-' $frame $frameLen
-            [VhciIo]::Write($frame, $frameLen)
+                $frame = New-Object byte[] $frameLen
+                [Array]::Copy($acc, 0, $frame, 0, $frameLen)
+                Write-Frame '<-' $frame $frameLen
+                [VhciIo]::Write($frame, $frameLen)
+                $toDriver++
 
-            $accLen -= $frameLen
-            if ($accLen -gt 0) { [Array]::Copy($acc, $frameLen, $acc, 0, $accLen) }
-        }
+                $accLen -= $frameLen
+                if ($accLen -gt 0) { [Array]::Copy($acc, $frameLen, $acc, 0, $accLen) }
+                $progress = $true
+            }
+        } while ($progress)
     }
 } finally {
+    # Read the counters before closing: the handle is what the IOCTL needs, and
+    # closing it also resets the backlogs.
+    if ($Stats -gt 0) {
+        Write-Host 'final stats' -ForegroundColor Cyan
+        Write-Host ("   bridge       ->controller $toController   ->driver $toDriver")
+        try   { Format-VhciStats ([VhciIo]::GetStats()) | ForEach-Object { Write-Host $_ } }
+        catch { Write-Host "  could not read stats: $($_.Exception.Message)" -ForegroundColor Yellow }
+    }
     Write-Host 'closing (this removes the radio)' -ForegroundColor Cyan
     [VhciIo]::Close()
     $tcp.Close()

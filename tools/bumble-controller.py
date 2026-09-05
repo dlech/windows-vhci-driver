@@ -65,6 +65,67 @@ PEER_NOTIFY_UUID  = "7a9b0004-4c1d-4e2a-9f3b-1d2c3e4f5a6b"
 PEER_READ_VALUE = b"hello from bumble"
 
 
+def advertising_report(address: str, rssi: int = -60) -> bytes:
+    """One HCI_LE_Advertising_Report event, as an H4 frame.
+
+    Built with Bumble's own encoder rather than by hand. A hand-written version
+    of this frame in PowerShell had the address bytes in the wrong order - the
+    address is little-endian on the wire - which is invisible in a flood test
+    that only counts packets, and would have quietly made the load unrealistic.
+    """
+    report = hci.HCI_LE_Advertising_Report_Event.Report(
+        event_type=0x00,  # ADV_IND
+        address_type=hci.Address.PUBLIC_DEVICE_ADDRESS,
+        address=hci.Address(address, hci.Address.PUBLIC_DEVICE_ADDRESS),
+        data=b"",
+        rssi=rssi,
+    )
+    # bytes() on an HCI_Packet already includes the H4 type byte.
+    return bytes(hci.HCI_LE_Advertising_Report_Event(reports=[report]))
+
+
+async def flood(
+    sink, count: int, after: float, address: str, started: asyncio.Event
+) -> None:
+    """Push `count` advertising reports at the host stack as fast as possible.
+
+    The reports are unsolicited, which is realistic - a real controller sends
+    them whenever it hears an advertisement, and the host reads them when it
+    gets round to it - but the rate is not: nothing here waits for the stack to
+    keep up, which is the entire point.
+
+    `after` is measured from the host stack's FIRST HCI command, not from
+    process start. That distinction decides what the run measures, because the
+    two interesting regimes are seconds apart:
+
+    * `--flood-after 0` lands during bring-up, while the stack is still
+      initialising and has no reads pended for events. The driver's
+      controller-to-host backlog fills and writes are pended: this is the
+      backpressure path.
+    * `--flood-after 20` lands on a settled stack, which keeps a read pended at
+      all times and absorbs the lot without the backlog ever growing. This is
+      the throughput path.
+
+    Timing it from process start instead measured neither reliably - whichever
+    regime you got depended on how quickly the client happened to connect.
+
+    It only means anything with a live controller underneath. Flooding a driver
+    whose radio never completed HCI initialisation just fills a backlog nobody
+    is draining, and every write then blocks until it times out; that measures
+    the absence of a controller, not the driver.
+    """
+    await started.wait()
+    await asyncio.sleep(after)
+    frame = advertising_report(address)
+    print(f"flooding {count} advertising reports ({len(frame)} bytes each)",
+          flush=True)
+    t0 = asyncio.get_running_loop().time()
+    for _ in range(count):
+        sink.on_packet(frame)
+    elapsed = asyncio.get_running_loop().time() - t0
+    print(f"queued {count} reports in {elapsed:.2f}s", flush=True)
+
+
 def build_peer_service() -> Service:
     """One service with a readable, a writable and a notifiable characteristic.
 
@@ -110,6 +171,8 @@ async def run(
     peer_name: str,
     dual_mode: bool,
     peer_address_type: str = "random",
+    flood_packets: int = 0,
+    flood_after: float = 20.0,
 ) -> None:
     # A LocalLink is Bumble's simulated radio medium. Controllers attached to
     # the same link can see each other, which is how a peer device becomes
@@ -189,6 +252,26 @@ async def run(
         print(f"  lmp_features = 0x{int(controller.lmp_features):016x}", flush=True)
         print("waiting for HCI traffic (Ctrl+C to stop)", flush=True)
 
+        if flood_packets:
+            # Fire the flood relative to the host stack's first HCI command,
+            # so the run measures the regime it was asked for rather than
+            # whichever one the client's connect timing happened to produce.
+            stack_awake = asyncio.Event()
+            original_on_command = controller.on_hci_command_packet
+
+            def on_hci_command_packet(command):
+                stack_awake.set()
+                return original_on_command(command)
+
+            controller.on_hci_command_packet = on_hci_command_packet
+
+            # After the flood, keep running: the reports have only been queued
+            # on the sink, and the client still has to read them out of the
+            # socket and hand them to the driver one at a time.
+            asyncio.create_task(
+                flood(sink, flood_packets, flood_after, peer_address,
+                      stack_awake))
+
         # Nothing else to do; the controller drives itself from the transport.
         await asyncio.Event().wait()
 
@@ -228,6 +311,25 @@ def main() -> int:
         default="random",
         help="address type the peer advertises from, with --peer",
     )
+    parser.add_argument(
+        "--flood",
+        type=int,
+        default=0,
+        metavar="N",
+        help="send N unsolicited advertising reports as fast as possible, "
+             "to load the driver's controller-to-host path",
+    )
+    parser.add_argument(
+        "--flood-after",
+        type=float,
+        default=20.0,
+        metavar="SECONDS",
+        help="how long to wait after the client connects before flooding, so "
+             "how long to wait after the host stack's first HCI command "
+             "before flooding. 0 floods during bring-up, while nothing is "
+             "reading events yet, which exercises backpressure; 20 floods a "
+             "settled stack, which measures throughput (default: 20)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -247,6 +349,8 @@ def main() -> int:
                 args.peer_name,
                 args.dual_mode,
                 args.peer_address_type,
+                args.flood,
+                args.flood_after,
             )
         )
     except KeyboardInterrupt:
