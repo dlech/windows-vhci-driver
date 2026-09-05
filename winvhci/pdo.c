@@ -94,6 +94,13 @@ Routine Description:
     NTSTATUS                    status;
 
     //
+    // IoControlCode is carried only so the failure path can name the request
+    // that could not be forwarded. That is a KdPrint, so in a release build the
+    // parameter genuinely is unreferenced.
+    //
+    UNREFERENCED_PARAMETER(IoControlCode);
+
+    //
     // Count arrivals at the PDO separately from arrivals at the FDO queue, so
     // "BthMini never sent us anything" and "the forward across the stacks
     // failed" are distinguishable rather than both looking like silence.

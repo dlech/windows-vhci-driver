@@ -115,6 +115,17 @@ WinVhciLogHciPacket(
     _In_ ULONG                Len
     )
 {
+#if !DBG
+    //
+    // Every statement below exists to produce KdPrint output, and KdPrint
+    // compiles to nothing in a release build. Compile the body away with it,
+    // rather than decoding a command header for every packet on the data path
+    // and then discarding the result.
+    //
+    UNREFERENCED_PARAMETER(Type);
+    UNREFERENCED_PARAMETER(Data);
+    UNREFERENCED_PARAMETER(Len);
+#else
     if (Data == NULL) {
         return;
     }
@@ -136,6 +147,7 @@ WinVhciLogHciPacket(
         KdPrint(("winvhci:   first bytes %02x %02x %02x %02x\n",
                  Data[0], Data[1], Data[2], Data[3]));
     }
+#endif
 }
 
 static NTSTATUS
