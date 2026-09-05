@@ -54,6 +54,33 @@ __all__ = [
 REMOTE_COMPANY_ID = 0xFFFF
 
 
+def _add_supported_commands(base, extra: set[int]):
+    """Add opcodes to a controller's supported-commands, whichever shape it has.
+
+    Bumble changed the representation. Up to 0.0.226 ``supported_commands`` is
+    the 64-byte bitmask the controller reports verbatim; from around 0.0.234 it
+    is a ``set`` of opcodes that Bumble turns into that bitmask when answering
+    Read_Local_Supported_Commands.
+
+    Both are supported here rather than requiring a floor, because a consumer's
+    pin is not ours to choose - Bleak pins 0.0.226 exactly, and this module has
+    to import under it. `Controller.supported_commands | {...}` did not, and the
+    failure was a TypeError at class-definition time, so the whole package
+    failed to import.
+
+    ``HCI_SUPPORTED_COMMANDS_MASKS`` maps an opcode to a single-bit integer
+    positioned within the little-endian mask, and it means the same thing in
+    both versions.
+    """
+    if isinstance(base, (set, frozenset)):
+        return set(base) | extra
+
+    value = int.from_bytes(base, 'little')
+    for opcode in extra:
+        value |= hci.HCI_SUPPORTED_COMMANDS_MASKS.get(opcode, 0)
+    return value.to_bytes(len(base), 'little')
+
+
 class WindowsCompatLink(LocalLink):
     """LocalLink that routes LE ACL data by the address the connection uses.
 
@@ -160,29 +187,32 @@ class WindowsCompatController(Controller):
     # this is the empirical value that works, not a claim about the minimum.
     le_states = bytes.fromhex('ffffffffffff0300')
 
-    supported_commands = Controller.supported_commands | {
-        # Implemented by Bumble, but missing from its bitmask.
-        hci.HCI_WRITE_LE_HOST_SUPPORT_COMMAND,
-        hci.HCI_READ_LE_HOST_SUPPORT_COMMAND,
-        hci.HCI_READ_LOCAL_EXTENDED_FEATURES_COMMAND,
-        hci.HCI_WRITE_CLASS_OF_DEVICE_COMMAND,
-        hci.HCI_WRITE_EXTENDED_INQUIRY_RESPONSE_COMMAND,
-        # Implemented by the handlers below.
-        hci.HCI_WRITE_AUTHENTICATION_ENABLE_COMMAND,
-        hci.HCI_WRITE_PAGE_TIMEOUT_COMMAND,
-        hci.HCI_WRITE_PAGE_SCAN_ACTIVITY_COMMAND,
-        hci.HCI_WRITE_INQUIRY_SCAN_ACTIVITY_COMMAND,
-        hci.HCI_WRITE_INQUIRY_MODE_COMMAND,
-        hci.HCI_WRITE_SCAN_ENABLE_COMMAND,
-        hci.HCI_WRITE_LOCAL_NAME_COMMAND,
-        hci.HCI_WRITE_SIMPLE_PAIRING_MODE_COMMAND,
-        hci.HCI_WRITE_SECURE_CONNECTIONS_HOST_SUPPORT_COMMAND,
-        hci.HCI_WRITE_CONNECTION_ACCEPT_TIMEOUT_COMMAND,
-        hci.HCI_WRITE_PAGE_SCAN_TYPE_COMMAND,
-        hci.HCI_WRITE_VOICE_SETTING_COMMAND,
-        hci.HCI_WRITE_SYNCHRONOUS_FLOW_CONTROL_ENABLE_COMMAND,
-        hci.HCI_READ_INQUIRY_RESPONSE_TRANSMIT_POWER_LEVEL_COMMAND,
-    }
+    supported_commands = _add_supported_commands(
+        Controller.supported_commands,
+        {
+            # Implemented by Bumble, but missing from its bitmask.
+            hci.HCI_WRITE_LE_HOST_SUPPORT_COMMAND,
+            hci.HCI_READ_LE_HOST_SUPPORT_COMMAND,
+            hci.HCI_READ_LOCAL_EXTENDED_FEATURES_COMMAND,
+            hci.HCI_WRITE_CLASS_OF_DEVICE_COMMAND,
+            hci.HCI_WRITE_EXTENDED_INQUIRY_RESPONSE_COMMAND,
+            # Implemented by the handlers below.
+            hci.HCI_WRITE_AUTHENTICATION_ENABLE_COMMAND,
+            hci.HCI_WRITE_PAGE_TIMEOUT_COMMAND,
+            hci.HCI_WRITE_PAGE_SCAN_ACTIVITY_COMMAND,
+            hci.HCI_WRITE_INQUIRY_SCAN_ACTIVITY_COMMAND,
+            hci.HCI_WRITE_INQUIRY_MODE_COMMAND,
+            hci.HCI_WRITE_SCAN_ENABLE_COMMAND,
+            hci.HCI_WRITE_LOCAL_NAME_COMMAND,
+            hci.HCI_WRITE_SIMPLE_PAIRING_MODE_COMMAND,
+            hci.HCI_WRITE_SECURE_CONNECTIONS_HOST_SUPPORT_COMMAND,
+            hci.HCI_WRITE_CONNECTION_ACCEPT_TIMEOUT_COMMAND,
+            hci.HCI_WRITE_PAGE_SCAN_TYPE_COMMAND,
+            hci.HCI_WRITE_VOICE_SETTING_COMMAND,
+            hci.HCI_WRITE_SYNCHRONOUS_FLOW_CONTROL_ENABLE_COMMAND,
+            hci.HCI_READ_INQUIRY_RESPONSE_TRANSMIT_POWER_LEVEL_COMMAND,
+        },
+    )
 
     def on_hci_write_authentication_enable_command(self, _command):
         return hci.HCI_StatusReturnParameters(hci.HCI_ErrorCode.SUCCESS)

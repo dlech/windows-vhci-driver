@@ -15,6 +15,21 @@ and the set of supported runner images.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-05
+
+### Fixed
+
+- `winvhci.bumble_compat` failed to import against Bumble 0.0.226 — and so,
+  therefore, did `winvhci.transport`. Bumble changed
+  `Controller.supported_commands` from a 64-byte bitmask to a set of opcodes, so
+  extending it with `|` raised a `TypeError` while the class body was executing.
+  Both representations are now handled, because a consumer's Bumble pin is not
+  ours to choose: Bleak pins 0.0.226 exactly.
+
+  Found by running Bleak's integration tests against the driver, which is too
+  late and in the wrong repository, so the unit tests now cover the shims and CI
+  runs them against both the oldest pinned Bumble and the latest.
+
 ## [1.0.0] - 2026-09-05
 
 First release.
@@ -67,5 +82,6 @@ First release.
   reboot — so the teardown abuse suite runs unverified in CI and under Verifier
   only on a developer machine.
 
-[Unreleased]: https://github.com/dlech/windows-vhci-driver/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/dlech/windows-vhci-driver/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/dlech/windows-vhci-driver/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/dlech/windows-vhci-driver/releases/tag/v1.0.0

@@ -215,8 +215,21 @@ jobs:
   # those classes, so that would break the consumer path while every
   # driver-level test kept passing.
   python-unit:
-    name: python unit tests
+    name: python unit tests (bumble ${{ matrix.bumble }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of the range that matters, because the shims reach into
+        # Bumble's internals and a consumer's pin is not ours to choose.
+        #
+        # 0.0.226 is what Bleak pins exactly. Testing only against the latest
+        # missed a real break: Controller.supported_commands changed from a
+        # bitmask to a set, `Controller.supported_commands | {...}` raised a
+        # TypeError at class-definition time under 0.0.226, and the whole
+        # package failed to import. Bleak's own test suite found it, which is
+        # too late and in the wrong repository.
+        bumble: ['0.0.226', 'latest']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -226,14 +239,30 @@ jobs:
 
       - name: Install
         run: |
-          python -m pip install --disable-pip-version-check --no-deps bumble
+          if [ '${{ matrix.bumble }}' = 'latest' ]; then
+            python -m pip install --disable-pip-version-check --no-deps bumble
+          else
+            python -m pip install --disable-pip-version-check --no-deps 'bumble==${{ matrix.bumble }}'
+          fi
           python -m pip install --disable-pip-version-check typing_extensions pyee
           python -m pip install --disable-pip-version-check './python[test]'
+          python -c "import bumble; print('bumble', bumble.__version__)"
 
       - name: Test
+        # From inside python/, not the repository root. The root holds
+        # winvhci/ - the DRIVER's C source - and `python -m pytest` puts the
+        # working directory first on sys.path, where that directory looks like
+        # an implicit namespace package of the same name. An INSTALLED regular
+        # package still wins over a namespace portion found earlier, so running
+        # from the root does work; it just relies on that rule, and it fails
+        # outright for a contributor who has not installed the package. Running
+        # from here needs neither, and picks up python/pyproject.toml's pytest
+        # configuration, which is what it was written for.
+        #
         # test_transport.py skips itself off Windows; test_transport_wiring.py
-        # is the part that runs here.
-        run: python -m pytest python/tests -v
+        # and test_bumble_compat.py are the parts that run here.
+        working-directory: python
+        run: python -m pytest tests -v
 
   # Everything above tests the driver. This job tests the way a CONSUMER reaches
   # it: actions/install to install the driver, then the winvhci Python package
