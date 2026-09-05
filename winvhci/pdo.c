@@ -118,6 +118,13 @@ Routine Description:
 {
     PWINVHCI_PDO_CONTEXT pdoCtx = WinVhciPdoGetContext(Device);
 
+    //
+    // TargetState is carried only so the trace can name the state being
+    // entered. That is a KdPrint, which compiles to nothing in a release
+    // build, so there the parameter genuinely is unreferenced.
+    //
+    UNREFERENCED_PARAMETER(TargetState);
+
     KdPrint(("winvhci: pdo D0 exit (target %d); the stack has stopped consuming\n",
              TargetState));
 
