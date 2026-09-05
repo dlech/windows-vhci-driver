@@ -30,8 +30,10 @@ param(
     [switch]$Bumble,
     [string]$Python = 'python',
 
-    # Tier 3: run the whole thing under Driver Verifier, then abuse the teardown
-    # path, which docs/implementation-plan.md still lists as the open risk.
+    # Tier 3: abuse the teardown path - which implementation-plan.md still lists
+    # as the open risk - under what Verifier coverage a job without a reboot can
+    # actually get, which is force-pending-I/O and IRP logging rather than the
+    # standard rule set. See the arming block for why.
     [switch]$Verifier,
     [int]   $AbuseRounds = 3,
 
@@ -217,54 +219,59 @@ if ($Verifier) {
     #
     # This runs after the driver has loaded, because DIF instruments a running
     # driver rather than arranging for a future one to be verified.
-    # The help documents the no-reboot form as '/dif [classes] /now', with no
-    # mention of /driver, and passing /driver alongside it fails silently. So
-    # the driver list may need configuring separately from the activation.
-    # Rather than guess, try the plausible shapes in order and let
-    # `verifier /query` decide which one actually took - arming and verifying
-    # are different things, and a silently ineffective Verifier is worse than
-    # none, because every later check would pass and appear to mean something
-    # it does not.
-    $classes = @('1', '2', '4', '5', '6', '8', '9', '12', '18', '20')
+    # What is actually achievable here is narrower than /standard, and it is
+    # worth being precise about why, because three other forms look like they
+    # should work and do not.
+    #
+    #   verifier /dif <classes> /now [/driver winvhci.sys]
+    #       Exits 1 and prints nothing, with or without /driver, on both
+    #       windows-2025 and windows-11-vs2026-arm. This is the form the help
+    #       text itself recommends for enabling flags without rebooting.
+    #
+    #   verifier /rc <classes> /driver winvhci.sys
+    #       Works - it reports "Verifier Flags: 0x001a09bb" - but exits 2,
+    #       meaning the settings are persistent and need a reboot. A CI job
+    #       cannot reboot, so the flags would never take effect.
+    #
+    #   verifier /volatile /adddriver winvhci.sys
+    #       Exits 0 and makes /query list the driver, which looks like success
+    #       and is not: it reports "Verifier Volatile Flags: 0x00000000". The
+    #       driver is enrolled with no checks enabled at all.
+    #
+    # So the driver has to be enrolled AND flags set, and only three flags are
+    # permitted in volatile mode. Of those, randomized low resources simulation
+    # (0x4) is already known not to reach this driver - development.md records
+    # it failing none of 24 allocations, because both allocation sites call
+    # ExAllocatePool2 under the FDO spinlock at DISPATCH_LEVEL. That leaves:
+    #
+    #   0x200  force pending I/O requests
+    #   0x400  IRP logging
+    #
+    # Force pending I/O is the valuable one for this driver. It makes IRPs that
+    # would have completed synchronously complete later instead, which is
+    # precisely the shape of the read path - and the teardown abuse below is
+    # about what happens to pended reads when their client dies.
+    #
+    # This is NOT the standard rule set, and it should not be described as
+    # such. Special pool, IRQL checking and DDI compliance need a reboot and so
+    # remain a local step, as development.md already describes.
+    $volatileFlags = '0x600'
 
-    function Test-VerifierArmed {
-        $q = verifier /query 2>&1 | Out-String
-        return [bool]($q -match '(?i)winvhci')
-    }
+    verifier /volatile /adddriver winvhci.sys 2>&1 | ForEach-Object { Write-Host "  $_" }
+    verifier /volatile /flags $volatileFlags 2>&1 | ForEach-Object { Write-Host "  $_" }
 
-    function Invoke-Verifier([string[]]$Argv) {
-        Write-Host "  verifier $($Argv -join ' ')"
-        $out = & verifier @Argv 2>&1 | Out-String
-        $rc  = $LASTEXITCODE
-        $first = ($out.Trim() -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
-        Write-Host "    exit $rc  $first"
-    }
+    $query = verifier /query 2>&1 | Out-String
 
-    # Built as named variables rather than inline. An array of argument arrays
-    # needs the unary comma to stay nested - written inline alongside a + the
-    # whole thing flattens, and every token becomes its own invocation.
-    $difWithDriver = @('/dif') + $classes + @('/now', '/driver', 'winvhci.sys')
-    $rcSelect      = @('/rc')  + $classes + @('/driver', 'winvhci.sys')
-    $difNow        = @('/dif') + $classes + @('/now')
-    $volatileAdd   = @('/volatile', '/adddriver', 'winvhci.sys')
-
-    $strategies = @(
-        @{ name = 'dif with driver';          steps = , $difWithDriver }
-        @{ name = 'rc to select, dif to arm'; steps = @($rcSelect, $difNow) }
-        @{ name = 'dif alone';                steps = , $difNow }
-        @{ name = 'volatile adddriver';       steps = , $volatileAdd }
-    )
-
-    $armedBy = $null
-    foreach ($s in $strategies) {
-        Write-Host "  -- $($s.name) --" -ForegroundColor DarkGray
-        foreach ($step in $s.steps) { Invoke-Verifier $step }
-        if (Test-VerifierArmed) { $armedBy = $s.name; break }
-    }
-
-    Check 'Driver Verifier is verifying winvhci.sys' { $null -ne $armedBy } `
-          'no invocation made verifier /query list the driver'
-    if ($armedBy) { Write-Host "  armed by: $armedBy" -ForegroundColor Green }
+    # Both halves, deliberately. Enrolment alone passed the previous version of
+    # this check while zero flags were set, which is the exact failure mode the
+    # check exists to catch.
+    Check 'Verifier has winvhci.sys enrolled' { $query -match '(?i)winvhci' } `
+          'verifier /query does not list the driver'
+    Check 'Verifier has non-zero volatile flags' {
+        if ($query -match '(?im)^\s*Verifier Volatile Flags:\s*(0x[0-9a-f]+)') {
+            [Convert]::ToInt64($Matches[1], 16) -ne 0
+        } else { $false }
+    } 'enrolled with no checks enabled is not verification'
 }
 
 Write-Host ''
@@ -440,7 +447,7 @@ if ($Bumble) {
 
 if ($Verifier -and $Bumble) {
     Write-Host ''
-    Write-Host '=== Tier 3: teardown abuse, under Verifier ===' -ForegroundColor Cyan
+    Write-Host '=== Tier 3: teardown abuse, with pending-I/O forced ===' -ForegroundColor Cyan
 
     # A client dying abruptly is the NORMAL case here, not an edge case: the
     # radio's lifetime is a file handle's lifetime. When it dies the driver has
@@ -515,11 +522,15 @@ pnputil /enum-drivers | ForEach-Object {
 Check 'nothing winvhci remains' { -not (Get-Fdo) -and -not (Get-Radio) }
 
 if ($Verifier) {
-    # /stop is the counterpart to '/dif ... /now' - it halts the rule classes
-    # enabled that way. Nothing here reboots, so leaving verification armed for
-    # a driver that has just been uninstalled would be a trap for whatever runs
-    # next on this machine.
-    verifier /stop 2>&1 | ForEach-Object { Write-Host "  $_" }
+    # Counterparts to what was actually used: the driver was enrolled with
+    # /volatile /adddriver and the flags set with /volatile /flags, so both come
+    # back off the same way. (/stop is for rule classes enabled via '/dif /now',
+    # which is not the mechanism that worked here.)
+    #
+    # Nothing here reboots, so leaving verification armed for a driver that has
+    # just been uninstalled would be a trap for whatever runs next.
+    verifier /volatile /flags 0x0 2>&1 | ForEach-Object { Write-Host "  $_" }
+    verifier /volatile /removedriver winvhci.sys 2>&1 | ForEach-Object { Write-Host "  $_" }
 }
 
 Write-Host ''
