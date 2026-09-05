@@ -162,6 +162,13 @@ jobs:
           python -m pip install --disable-pip-version-check typing_extensions pyee
           python -c "import bumble; print('bumble', bumble.__version__)"
 
+          # tools/bumble-controller.py imports winvhci.bumble_compat for the
+          # Windows compatibility shims, which live in the package so that a
+          # consumer's test suite gets the same copy this smoke test exercises.
+          # The package declares no dependencies of its own.
+          python -m pip install --disable-pip-version-check .\python
+          python -c "import winvhci; print('winvhci', winvhci.__version__)"
+
       - name: Install and assert
         # Windows PowerShell 5.1, not pwsh: tools\vhci-io.ps1 and the WinRT
         # paths this leads to are written for it, and PowerShell 7 dropped the
@@ -198,5 +205,122 @@ jobs:
         if: always()
         with:
           name: smoke-diag-${{ matrix.platform }}
+          path: diag/
+          if-no-files-found: warn
+
+  # The transport's wiring needs neither a driver nor Windows, so it is checked
+  # here in about a minute rather than waiting on a Windows runner. What it
+  # actually guards is Bumble changing the shape of PumpedPacketSource /
+  # PumpedPacketSink / PumpedTransport: nothing else in this repository touches
+  # those classes, so that would break the consumer path while every
+  # driver-level test kept passing.
+  python-unit:
+    name: python unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: |
+          python -m pip install --disable-pip-version-check --no-deps bumble
+          python -m pip install --disable-pip-version-check typing_extensions pyee
+          python -m pip install --disable-pip-version-check './python[test]'
+
+      - name: Test
+        # test_transport.py skips itself off Windows; test_transport_wiring.py
+        # is the part that runs here.
+        run: python -m pytest python/tests -v
+
+  # Everything above tests the driver. This job tests the way a CONSUMER reaches
+  # it: actions/install to install the driver, then the winvhci Python package
+  # to open the device and plug it into Bumble. Both are the published interface,
+  # and an action nobody runs is an action that has quietly stopped working -
+  # which is the same failure class as a release installer that was never
+  # tested.
+  #
+  # It asserts what the PowerShell smoke test asserts at its core - that Windows
+  # binds bth.inf and BthMini to the radio our driver invents - but through the
+  # Python path, so a regression in either half is attributed correctly.
+  consumer:
+    name: consumer action ${{ matrix.platform }} on ${{ matrix.runner }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            runner: windows-2025
+          - platform: ARM64
+            runner: windows-11-vs2026-arm
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: winvhci-${{ matrix.platform }}-Debug
+          path: pkg
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Bumble
+        shell: pwsh
+        run: |
+          # --no-deps for the same reason as the smoke job: Bumble's full
+          # dependency set pulls in grpcio and cryptography, and with no arm64
+          # Windows wheel both try to compile from source and fail.
+          python -m pip install --disable-pip-version-check --no-deps bumble
+          python -m pip install --disable-pip-version-check typing_extensions pyee
+
+      # The action under test. Referenced by path so the job tests THIS commit
+      # rather than a published tag; a consumer would write
+      # `uses: dlech/windows-vhci-driver/actions/install@v1` and pass `version:`
+      # instead of `package-path:`.
+      - name: Install the driver with the action
+        id: winvhci
+        uses: ./actions/install
+        with:
+          package-path: pkg
+
+      - name: Report what the action produced
+        shell: pwsh
+        run: |
+          Write-Host "device-path  ${{ steps.winvhci.outputs.device-path }}"
+          Write-Host "instance-id  ${{ steps.winvhci.outputs.instance-id }}"
+          if (-not '${{ steps.winvhci.outputs.instance-id }}') {
+            throw 'the action did not report an instance id'
+          }
+
+      - name: Drive the radio from Python
+        # Windows PowerShell 5.1, matching the smoke job: nothing here needs it
+        # directly, but the pytest run shells out to Get-PnpDevice and keeping
+        # one shell across both jobs removes a difference that would otherwise
+        # have to be reasoned about on a failure.
+        shell: powershell
+        run: |
+          # Quoted: PowerShell treats [test] as a wildcard in a bare path.
+          python -m pip install --disable-pip-version-check ".\python[test]"
+          python -m pytest python\tests -v
+
+      - name: Collect diagnostics
+        if: always()
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path diag -Force | Out-Null
+          Copy-Item "$env:windir\INF\setupapi.dev.log" diag\ -ErrorAction SilentlyContinue
+          pnputil /enum-devices /problem > diag\problem-devices.txt 2>&1
+          Get-PnpDevice | Format-List * | Out-File diag\pnp-all.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: consumer-diag-${{ matrix.platform }}
           path: diag/
           if-no-files-found: warn
