@@ -1,0 +1,200 @@
+# Install the winvhci virtual Bluetooth controller on a GitHub-hosted Windows
+# runner.
+#
+#     - uses: dlech/windows-vhci-driver/actions/install@v1
+#     - run: pytest tests/test_winrt_backend.py
+#
+# No VM and no secrets. GitHub's Windows runner images run
+# `bcdedit.exe /set TESTSIGNING ON` at image build time and assert it in an
+# image validation test, so a test-signed driver loads directly on a runner.
+#
+# This action installs the driver and nothing else. It deliberately does NOT
+# create a radio: the radio's lifetime is a device handle's lifetime, so
+# whichever process holds \\.\WinVhci owns it, and that has to be the test
+# process for teardown to be deterministic. Use the `winvhci` Python package to
+# open the device and plug it into Bumble:
+#
+#     from winvhci.transport import open_winvhci_transport
+#     async with await open_winvhci_transport() as transport:
+#         ...
+#
+# Runner support:
+#   windows-2025            works. Server 2025, but it has the full Bluetooth
+#                           stack and Radio access is Allowed.
+#   windows-11-vs2026-arm   works. Windows 11 client, ARM64.
+#   windows-2022            NOT supported: Radio.RequestAccessAsync returns
+#                           DeniedByUser and the user-mode Bluetooth services
+#                           are absent, so WinRT Bluetooth cannot be used even
+#                           though the driver itself loads.
+
+name: Install winvhci
+description: Install the winvhci virtual Bluetooth HCI controller so Windows presents a virtual Bluetooth radio
+author: David Lechner
+
+branding:
+  icon: bluetooth
+  color: blue
+
+inputs:
+  version:
+    description: >-
+      Release tag of windows-vhci-driver to install, for example v0.1.0.
+      Ignored when package-path is set.
+    required: false
+    default: ''
+  package-path:
+    description: >-
+      Path to an already-built package directory containing winvhci.inf,
+      winvhci.sys, winvhci.cat and winvhci-test.cer. Use this to test a package
+      built earlier in the same workflow instead of downloading a release.
+    required: false
+    default: ''
+  allow-interactive-users:
+    description: >-
+      Relax the device DACL so unelevated interactive users can open
+      \\.\WinVhci. Not needed on a hosted runner, where jobs already run
+      elevated. Whoever can open the device can inject arbitrary HCI into the
+      machine's Bluetooth stack, so leave this off unless a test genuinely runs
+      unelevated.
+    required: false
+    default: 'false'
+  token:
+    description: Token used to download the release asset.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  device-path:
+    description: The device to open, always \\.\WinVhci.
+    value: ${{ steps.install.outputs.device-path }}
+  instance-id:
+    description: PnP instance ID of the installed device, e.g. ROOT\SYSTEM\0001.
+    value: ${{ steps.install.outputs.instance-id }}
+  package-dir:
+    description: Directory the installed package was read from.
+    value: ${{ steps.resolve.outputs.package-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the runner
+      shell: pwsh
+      run: |
+        if ($env:RUNNER_OS -ne 'Windows') {
+          throw "winvhci is a Windows kernel driver; this runner is $env:RUNNER_OS."
+        }
+        # Assert the platform is what we think it is, so a change to GitHub's
+        # images fails as itself rather than as a mysterious driver load
+        # failure. This has held since 2021 and is covered by an image
+        # validation test, but it is one line to check.
+        $bcd = bcdedit /enum '{current}' | Out-String
+        if ($bcd -notmatch 'testsigning\s+Yes') {
+          throw 'test signing is not enabled on this runner image, so a test-signed driver cannot load.'
+        }
+        Write-Host 'testsigning: Yes'
+
+    - name: Resolve the package
+      id: resolve
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        if ('${{ inputs.package-path }}') {
+          $dir = (Resolve-Path '${{ inputs.package-path }}').Path
+          Write-Host "using package at $dir"
+          "package-dir=$dir" | Out-File $env:GITHUB_OUTPUT -Append
+          exit 0
+        }
+
+        $version = '${{ inputs.version }}'
+        if (-not $version) {
+          throw 'Set either version (a release tag) or package-path.'
+        }
+
+        # OSArchitecture, not PROCESSOR_ARCHITECTURE: the environment variable
+        # reports the architecture of the current PROCESS, so an emulated x64
+        # shell on an ARM64 runner reports AMD64 and would download the wrong
+        # package.
+        $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
+          'X64'   { 'x64' }
+          'Arm64' { 'arm64' }
+          default { throw "unsupported architecture: $_" }
+        }
+
+        $asset = "winvhci-$version-$arch.zip"
+        $url = "https://github.com/dlech/windows-vhci-driver/releases/download/$version/$asset"
+        Write-Host "downloading $url"
+
+        $zip = Join-Path $env:RUNNER_TEMP $asset
+        $dir = Join-Path $env:RUNNER_TEMP 'winvhci-package'
+        Invoke-WebRequest -Uri $url -OutFile $zip -Headers @{
+          Authorization = "Bearer $env:GH_TOKEN"
+        } -UseBasicParsing
+        Expand-Archive -Path $zip -DestinationPath $dir -Force
+
+        "package-dir=$dir" | Out-File $env:GITHUB_OUTPUT -Append
+
+    - name: Install
+      id: install
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        # $env:GITHUB_ACTION_PATH is this action's directory inside the checked
+        # out action repository, so the installer and the SetupAPI shim it needs
+        # are both reachable from it. The consumer's own checkout is untouched.
+        $repo = Split-Path -Parent (Split-Path -Parent $env:GITHUB_ACTION_PATH)
+        $installer = Join-Path $repo 'build\install-winvhci.ps1'
+        if (-not (Test-Path $installer)) {
+          throw "installer not found at $installer"
+        }
+
+        $args = @(
+          '-PackageDir', '${{ steps.resolve.outputs.package-dir }}',
+          '-NoPrompt'
+        )
+        if ('${{ inputs.allow-interactive-users }}' -eq 'true') {
+          $args += '-AllowInteractiveUsers'
+        }
+
+        # Windows PowerShell 5.1, not pwsh. The installer and the scripts it
+        # calls use Get-PnpDevice and Get-PnpDeviceProperty, which come from the
+        # PnpDevice module and are not available in PowerShell 7 on every image.
+        & powershell.exe -ExecutionPolicy Bypass -File $installer @args
+        $rc = $LASTEXITCODE
+        if ($rc -ne 0) {
+          throw "install-winvhci.ps1 exited $rc"
+        }
+
+        $query = Join-Path $env:GITHUB_ACTION_PATH 'query-device.ps1'
+        $json = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $query
+        if (-not $json) { throw 'no winvhci device is present after install' }
+
+        $fdo = $json | ConvertFrom-Json
+        if ($fdo.status -ne 'OK') {
+          throw "the device did not reach Status OK: $($fdo.status) / $($fdo.problem)"
+        }
+
+        # Written from pwsh deliberately: Out-File in Windows PowerShell 5.1
+        # defaults to UTF-16, which GITHUB_OUTPUT cannot parse.
+        'device-path=\\.\WinVhci'        | Out-File $env:GITHUB_OUTPUT -Append
+        "instance-id=$($fdo.instanceId)" | Out-File $env:GITHUB_OUTPUT -Append
+        Write-Host "installed: $($fdo.instanceId)"
+
+    - name: Install the Python client
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $repo = Split-Path -Parent (Split-Path -Parent $env:GITHUB_ACTION_PATH)
+        $pkg = Join-Path $repo 'python'
+        if (Get-Command python -ErrorAction SilentlyContinue) {
+          # No dependencies of its own, so this cannot disturb the caller's
+          # environment; winvhci.transport imports Bumble lazily and the caller
+          # installs Bumble itself.
+          python -m pip install --disable-pip-version-check $pkg
+          if ($LASTEXITCODE -ne 0) { throw "pip install $pkg failed" }
+        } else {
+          Write-Host 'no python on PATH; skipping the winvhci Python client'
+        }

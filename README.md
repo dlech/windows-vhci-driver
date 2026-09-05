@@ -64,6 +64,50 @@ guest:  .\win-ble-connect.ps1     # GATT connect, read and write
 The bridge must stay running for as long as the radio is wanted: closing the handle to
 `\\.\WinVhci` removes the radio, exactly as closing `/dev/vhci` does on Linux.
 
+## Using it from CI
+
+A Windows job on GitHub Actions can install the driver and get a working Bluetooth radio with
+no VM and no secrets — GitHub's Windows runner images enable test signing at image build time,
+so a test-signed driver loads directly:
+
+```yaml
+    - uses: dlech/windows-vhci-driver/actions/install@v1
+      with:
+        version: v0.1.0
+    - run: pytest tests/test_bluetooth.py
+```
+
+Runs on `windows-2025` and `windows-11-vs2026-arm`. Not `windows-2022`: the driver loads, but
+`Radio.RequestAccessAsync` returns `DeniedByUser` and the user-mode Bluetooth services are
+absent.
+
+The action installs the driver and stops there — it deliberately does not create a radio,
+because the radio's lifetime is a device handle's lifetime and the test process has to own it
+for teardown to be deterministic. The [`winvhci`](python/) Python package opens the device and
+plugs it into [Bumble](https://google.github.io/bumble/):
+
+```python
+from winvhci.bumble_compat import WindowsCompatController, WindowsCompatLink, apply_dual_mode
+from winvhci.transport import open_winvhci_transport
+
+async with await open_winvhci_transport() as transport:
+    controller = WindowsCompatController(
+        'winvhci', host_source=transport.source, host_sink=transport.sink,
+        link=WindowsCompatLink(), public_address='F0:F1:F2:F3:F4:F5')
+    apply_dual_mode(controller)
+    # Windows now has a radio, for as long as this block runs.
+```
+
+`WindowsCompatController` is not optional: a stock Bumble controller does not get Windows
+through bring-up, for three separate reasons recorded in
+[python/winvhci/bumble_compat.py](python/winvhci/bumble_compat.py).
+
+To install on a real machine instead, [build/install-winvhci.ps1](build/install-winvhci.ps1)
+checks each prerequisite by name and refuses rather than half-installing, and `-Uninstall`
+removes everything it added. By default only SYSTEM and Administrators may open the device,
+since whoever holds it can inject arbitrary HCI into the local Bluetooth stack;
+`-AllowInteractiveUsers` relaxes that for a development machine.
+
 ## Documentation
 
 - [docs/research.md](docs/research.md) — how the Windows Bluetooth stack is put together, where

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "winvhci"
+version = "0.1.0"
+description = "Userspace client and Bumble transport for the winvhci virtual Bluetooth HCI controller on Windows"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "David Lechner" }]
+keywords = ["bluetooth", "hci", "vhci", "windows", "bumble"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Win32 (MS Windows)",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+]
+
+# No install_requires. winvhci.device needs only ctypes from the standard
+# library, and Bumble is needed only by winvhci.transport - which matters on
+# Windows on ARM, where installing Bumble's full dependency set means compiling
+# grpcio and cryptography from source because neither publishes an arm64 wheel.
+dependencies = []
+
+[project.optional-dependencies]
+bumble = ["bumble"]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.urls]
+Homepage = "https://github.com/dlech/windows-vhci-driver"
+Issues = "https://github.com/dlech/windows-vhci-driver/issues"
+
+[tool.setuptools]
+packages = ["winvhci"]
+
+[tool.setuptools.package-data]
+winvhci = ["py.typed"]
+
+[tool.pytest.ini_options]
+# The tests need a real installed driver and an elevated session, so they are
+# not collected by a bare `pytest` from the repository root by accident.
+testpaths = ["tests"]
+asyncio_mode = "strict"
