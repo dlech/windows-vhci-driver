@@ -124,3 +124,7 @@ since whoever holds it can inject arbitrary HCI into the local Bluetooth stack;
 - [docs/development.md](docs/development.md) — toolchain, the QEMU test guest, the build loop,
   and how to see what the driver is doing.
 - [docs/implementation-plan.md](docs/implementation-plan.md) — what is built and what is left.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -246,6 +246,10 @@ Move-Item $cerPath (Join-Path $stage 'winvhci-test.cer') -Force
 Copy-Item (Join-Path $repo 'build\install-winvhci.ps1') $stage
 Copy-Item (Join-Path $repo 'build\ci\vhci-devnode.ps1') $stage
 
+# A release zip is a redistributed binary, and MIT requires the notice to travel
+# with it - "in all copies or substantial portions of the Software".
+Copy-Item (Join-Path $repo 'LICENSE') $stage
+
 $inf = Get-Content (Join-Path $stage 'package\winvhci.inf') -Raw
 $driverVer = if ($inf -match '(?m)^\s*DriverVer\s*=\s*(.+)$') { $Matches[1].Trim() } else { 'unknown' }
 
