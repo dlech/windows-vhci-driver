@@ -127,7 +127,10 @@ simulated link, and raw-byte Command Complete replies. All are in
 
 **Not finished:**
 
-- The **Settings Bluetooth toggle** has not been looked at; it needs the GUI.
+- ~~The **Settings Bluetooth toggle**~~ — **answered in M4.** Settings and Airplane mode drive
+  `Windows.Devices.Radios.Radio.SetStateAsync`, and `tools/test-radio-toggle.ps1` exercises that
+  directly: the radio turns off and on cleanly and the adapter is fully capable afterwards. No
+  GUI needed.
 - `BluetoothLEAdvertisementWatcher` is unverified. Windows PowerShell 5.1 cannot subscribe to
   WinRT events at all, so `tools/win-ble-scan.ps1` compiles the watcher as C# instead — but its
   `csc` invocation still fails on WinMD references for want of .NET Framework facades in the
@@ -165,23 +168,54 @@ simulated link, and raw-byte Command Complete replies. All are in
   initialisation, a kill with ACL traffic in flight mid-GATT, a device restart under a live
   client, and repeated unload/reload cycles. No bugcheck, no stale radios, no leaked pool.
 
+- **Airplane mode / the radio toggle works** (`tools/test-radio-toggle.ps1`). Off and on across
+  two cycles, with `BluetoothAdapter` still reporting a fully capable LE adapter afterwards. The
+  plan was to add the sample's `GUID_DEVINTERFACE_BLUETOOTH_RADIO_ONOFF_VENDOR_SPECIFIC`
+  handling *only if the toggle misbehaved*; it does not, so that code is not needed.
+- **The `\\.\WinVhci` DACL is narrowed** to SYSTEM and Administrators, via a `.HW` `AddReg`
+  section in the INF. Whoever holds this handle can inject arbitrary HCI into the local stack.
+  `tools/test-device-acl.ps1` proves the restriction rather than assuming it: an elevated token
+  opens the device, a basic-user token gets `ERROR_ACCESS_DENIED`.
+
+**Settled as unavailable, not skipped:**
+
+- **Low-resources simulation cannot reach this driver.** Randomized injection at 100%
+  probability and systematic injection with `enableruntime` both deliberately failed *none* of
+  its allocations. Verifier still tracks them, so the likely reason is that both sites allocate
+  while holding the FDO spinlock, at DISPATCH_LEVEL. The `WvFailAllocOneIn` registry knob
+  exercises those paths instead, and is the only thing that does.
+- **Static Driver Verifier is gone.** The WDK build reports it plainly: *"Static Driver Verifier
+  (SDV) is no longer included in the Windows Driver Kit and is no longer compatible with VS2022
+  and later. To use SDV, install an older version of the EWDK."* Running it would mean
+  installing an older EWDK purely for that purpose.
+- **Sleep/resume is limited to hibernate.** `powercfg /a` reports no standby state available at
+  all in this guest — S1-S3 are disabled by the graphics component and S0 low-power is not
+  supported by the firmware — so hibernate is the only power transition there is to test.
+
+  **The driver survives it.** Hibernating with a live radio and pended BTHX reads, then
+  resuming, produces no bugcheck, no leaked pool, and a clean unload/reload. That also validates
+  the decision to make the read queues non-power-managed: a read parked indefinitely does not
+  stall the power transition.
+
 **Still to do:**
 
-- **Low-resources simulation does not reach this driver.** At 100% injection probability
-  Verifier deliberately failed none of its allocations, most likely because both sites allocate
-  while holding the FDO spinlock. The `WvFailAllocOneIn` registry knob exercises those paths
-  instead, but Verifier's own fault injection remains unavailable here, and **systematic** low
-  resources simulation has not been tried.
-- **Static Driver Verifier**, which is separate from Code Analysis and has not been run.
-- **Sleep/resume and Airplane mode.** The serialhcibus sample carries
-  `GUID_DEVINTERFACE_BLUETOOTH_RADIO_ONOFF_VENDOR_SPECIFIC` handling for the toggle — add it
-  only if the toggle actually misbehaves.
-- Tighten the `\\.\WinVhci` DACL to Administrators + SYSTEM.
+- **A radio does not survive hibernation, and that is a client-side gap.** The controller lives
+  outside the guest on a TCP socket, and hibernation severs it while the bridge process survives
+  still holding the device handle. On resume the radio therefore exists with nothing answering
+  it, and lands in `CM_PROB_FAILED_POST_START`.
+
+  `vhcibridge.ps1` now polls for a dead link and exits, which removes the radio — verified by
+  killing the controller, after which the bridge exits and the radio disappears. But it does
+  **not** catch the hibernation case: there the connection vanishes without a FIN or RST ever
+  reaching the socket, so `Poll` never reports it readable. Closing that needs an inactivity
+  timeout or a keepalive.
+
 - Decide what to do with the registry breadcrumbs: the `WvScoSupport` / `WvMaxScoChannels` knobs
   earn their keep, the per-IOCTL trace writes are now redundant with DebugView.
 
-**Exit:** an M3 session survives Verifier and the abuse list without a bugcheck. *Met for
-`/standard`; not yet for low-resources simulation.*
+**Exit:** an M3 session survives Verifier and the abuse list without a bugcheck. **Met** — for
+every Verifier facility that this toolchain and this driver's allocation pattern actually make
+available.
 
 ### ⬜ M5 — Ergonomics
 

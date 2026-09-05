@@ -39,6 +39,26 @@ ExcludeFromSelect = *
 [WinVhci_Device.NT]
 CopyFiles = Drivers_Dir
 
+[WinVhci_Device.NT.HW]
+AddReg = WinVhci_Security_AddReg
+
+; Restrict who may open \\.\WinVhci.
+;
+; This device lets whoever holds it inject arbitrary HCI into the local
+; Bluetooth stack and receive everything the stack sends - it is the whole
+; radio. That is not something an unprivileged process should be able to open,
+; so the DACL is narrowed to the two principals that legitimately need it.
+;
+;   D:P            discretionary ACL, protected: no inherited entries
+;   (A;;GA;;;SY)   allow GENERIC_ALL to SYSTEM
+;   (A;;GA;;;BA)   allow GENERIC_ALL to the built-in Administrators group
+;
+; The PnP manager converts this SDDL string into the device object's security
+; descriptor, which is what an open through the symbolic link is checked
+; against.
+[WinVhci_Security_AddReg]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
 [Drivers_Dir]
 winvhci.sys
 

@@ -65,6 +65,33 @@ try {
 
     while ((Get-Date) -lt $deadline -and $tcp.Connected) {
 
+        # --- has the link died under us? ---------------------------------
+        #
+        # $tcp.Connected only reflects the last I/O operation, and
+        # $stream.DataAvailable is false for an idle socket and a dead one
+        # alike, so neither notices a link that has gone away. Poll does:
+        # readable with nothing available means the peer is gone.
+        #
+        # Exiting closes the device handle, which removes the radio: the
+        # controller went away, so the adapter goes away, which is exactly what
+        # closing /dev/vhci does on Linux. Verified by killing the controller -
+        # the bridge exits and the radio disappears.
+        #
+        # KNOWN GAP: this does NOT catch the socket being severed by
+        # hibernating the guest. There the connection vanishes without a FIN or
+        # RST ever reaching this socket, so Poll never reports it readable, and
+        # the bridge sits waiting on a link that is gone while still holding the
+        # handle. On resume the radio therefore still exists, the Bluetooth
+        # stack tries to initialise it, nothing answers, and it lands in
+        # CM_PROB_FAILED_POST_START. Catching that needs an inactivity timeout
+        # or a keepalive, which is not implemented.
+        #
+        if ($tcp.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead) -and
+            $tcp.Client.Available -eq 0) {
+            Write-Host 'controller disconnected' -ForegroundColor Yellow
+            break
+        }
+
         # --- Windows stack -> controller ---------------------------------
         # Each read yields exactly one whole H4 frame, so it can go straight
         # out on the socket.
