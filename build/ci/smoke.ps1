@@ -282,6 +282,26 @@ Check 'radio PDO disappears when the client closes' {
     Wait-For 'the WINVHCI\RADIO node to go away' { -not (Get-Radio) } 40
 } 'tearing the node down unloads BthPort''s whole stack above it, so it is not instant'
 
+Write-Host ''
+Write-Host '=== Backpressure ===' -ForegroundColor Cyan
+
+# In Tier 1 deliberately, and on every PR: this needs no controller emulator,
+# and it guards the one regression class that is invisible from the outside.
+# The driver used to discard a packet at a backlog depth of 64, and a dropped
+# advertising report is indistinguishable from a device that was never
+# advertising - so a reintroduced drop would show up as flaky discovery, days
+# later, in some other test.
+#
+# It runs here rather than in Tier 2 because flooding a LIVE controller does
+# not reach the backlog at all: a settled Bluetooth stack always has a read
+# pended, so 30,000 advertising reports at full speed went straight through
+# with the depth never once exceeding zero. Writing events before asking for a
+# radio is what makes it deterministic.
+& (Join-Path $ToolsDir 'test-backpressure.ps1')
+$bpRc = $LASTEXITCODE
+Check 'writes are pended, not dropped, when the backlog is full' { $bpRc -eq 0 } `
+      "test-backpressure.ps1 exited $bpRc"
+
 if ($Bumble) {
     Write-Host ''
     Write-Host '=== Tier 2: a real controller, and the stack Windows builds on it ===' -ForegroundColor Cyan

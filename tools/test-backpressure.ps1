@@ -76,6 +76,28 @@ $adv = [byte[]]@(
     0xC4                                 # RSSI -60
 )
 
+# PRECONDITION: no radio may exist yet.
+#
+# The whole method rests on nothing being able to drain, and a radio left over
+# from a previous run keeps BthPort reading. Closing the handle destroys the
+# radio, but PnP teardown is not instant - it unloads BthPort's entire stack
+# above the node - so two runs back to back had the second one silently
+# measure nothing: every write went straight through and three assertions
+# failed with no hint as to why.
+Write-Host 'waiting for any previous radio to go away' -ForegroundColor Cyan
+$deadline = (Get-Date).AddSeconds($SettleSec * 2)
+while ((Get-Date) -lt $deadline) {
+    $stale = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -like 'WINVHCI\RADIO*' -and $_.Problem -ne 'CM_PROB_PHANTOM' }
+    if (-not $stale) { break }
+    Start-Sleep -Seconds 1
+}
+if ($stale) {
+    Write-Host "  a radio is still present: $($stale.InstanceId) $($stale.Status) $($stale.Problem)" -ForegroundColor Red
+    Write-Host '  it would keep the Bluetooth stack draining, so this test cannot mean anything' -ForegroundColor Red
+    exit 2
+}
+
 Write-Host "opening $Device (no radio yet, so nothing can drain)" -ForegroundColor Cyan
 [VhciIo]::Open($Device)
 
@@ -98,8 +120,12 @@ try {
     Write-Host 'with nothing draining:' -ForegroundColor Cyan
     Assert 'no write was rejected' ($failed -eq 0) `
            "$failed writes failed. Backpressure must pend a write, never fail it"
-    Assert 'the backlog filled to its bound' ($mid.PendingEventPeak -ge $MAX_BACKLOG) `
-           "event peak reached $($mid.PendingEventPeak), expected at least $MAX_BACKLOG"
+    # The live depth, not the peak. Peaks are cumulative for the life of the
+    # device, so a peak assertion would pass vacuously when this runs after
+    # something else has already filled the backlog once - which is exactly
+    # what happens inside the CI smoke test.
+    Assert 'the backlog filled to its bound' ($mid.PendingEventCount -eq $MAX_BACKLOG) `
+           "event depth is $($mid.PendingEventCount), expected exactly $MAX_BACKLOG"
     Assert 'writes past the bound were pended' `
            ($mid.WritesPended - $before.WritesPended -ge $Packets - $MAX_BACKLOG) `
            "only $($mid.WritesPended - $before.WritesPended) writes pended"
@@ -116,11 +142,11 @@ try {
 
     # The radio has to be created, bth.inf has to bind, and BthPort has to
     # start pending reads before anything drains, so give it real time.
-    $deadline = (Get-Date).AddSeconds($SettleSec)
+    $drainBy = (Get-Date).AddSeconds($SettleSec)
     do {
         Start-Sleep -Milliseconds 500
         $now = [VhciIo]::GetStats()
-    } while ($now.WritesWaiting -gt 0 -and (Get-Date) -lt $deadline)
+    } while ($now.WritesWaiting -gt 0 -and (Get-Date) -lt $drainBy)
 
     $completed = 0
     $stillPending = 0
