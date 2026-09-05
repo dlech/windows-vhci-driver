@@ -27,6 +27,9 @@ the supported runner images.
 - An event or ACL write sent before the radio is requested is now refused with
   `STATUS_DEVICE_NOT_READY`, mirroring Linux's `-ENODEV`. It used to be queued
   and then replayed into the new radio's bring-up.
+- A control packet with a trailing tail, a reserved opcode bit, or an opcode
+  bit selecting a quirk with no Windows analogue is now refused rather than
+  silently ignored.
 - `vhci-io.ps1` ignored its own write timeout and could block forever.
 - `vhcibridge.ps1` mis-reported a burst larger than its 8 KB reassembly buffer
   as a malformed stream.
