@@ -133,14 +133,18 @@ Write-Host '=== Installing ===' -ForegroundColor Cyan
 # gets a hard timeout rather than an unbounded wait.
 $p = Start-Process pnputil.exe -ArgumentList @('/add-driver', $inf, '/install') `
         -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\pnputil.log"
+
+# Reading .Handle here is not redundant. Start-Process -PassThru hands back a
+# Process object that has not cached the native handle, and once the process
+# exits there is nothing left to query - so ExitCode comes back empty no matter
+# how carefully you wait for it. Touching .Handle while the process is still
+# alive caches it, and the exit code survives.
+$null = $p.Handle
+
 if (-not $p.WaitForExit(120000)) {
     $p.Kill()
     throw 'pnputil /add-driver hung for 120s - almost certainly a certificate trust problem'
 }
-# The timed WaitForExit overload returns as soon as the process signals, before
-# the Process object has finished collecting its exit state - so ExitCode reads
-# back empty. The parameterless call waits for that to settle.
-$p.WaitForExit()
 $rc = $p.ExitCode
 Get-Content "$env:TEMP\pnputil.log" | ForEach-Object { Write-Host "  $_" }
 

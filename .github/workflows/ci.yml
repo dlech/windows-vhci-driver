@@ -51,9 +51,42 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Restoring the WDK dominated the job: 110s of a 152s build. Two changes
+      # cut it. The packages are cached across runs, and each leg downloads only
+      # the three it needs rather than all five - the two architectures together
+      # come to about 2.2 GB extracted, and no single build needs the other
+      # architecture's SDK or WDK.
+      - name: Cache the WDK
+        id: wdk-cache
+        uses: actions/cache@v4
+        with:
+          path: packages
+          key: wdk-${{ matrix.platform }}-${{ env.WDK_VERSION }}-${{ hashFiles('packages.config') }}
+
       - name: Restore the WDK from NuGet
+        if: steps.wdk-cache.outputs.cache-hit != 'true'
         shell: pwsh
-        run: nuget restore .\packages.config -PackagesDirectory .\packages -NonInteractive
+        run: |
+          # packages.config stays the single source of truth for the version,
+          # and is what the cache key hashes; this only narrows what is fetched.
+          # Microsoft.Windows.SDK.CPP is the big one (809 MB) and cannot be
+          # dropped - it is what registers the SDK version, and without it the
+          # build fails MSB8036 "The Windows SDK version 10.0.28000.0 was not
+          # found".
+          [xml]$cfg = Get-Content packages.config
+          $ver  = ($cfg.packages.package | Select-Object -First 1).version
+          $arch = '${{ matrix.platform }}'.ToLower()
+          foreach ($id in @('Microsoft.Windows.SDK.CPP',
+                            "Microsoft.Windows.SDK.CPP.$arch",
+                            "Microsoft.Windows.WDK.$arch")) {
+            # -DependencyVersion Ignore because the WDK package declares a
+            # dependency on an OLDER SDK.CPP, and without this nuget helpfully
+            # fetches that too - a second 1 GB of packages sitting next to the
+            # pinned ones, in the cache, unused.
+            nuget install $id -Version $ver -OutputDirectory packages `
+                  -DependencyVersion Ignore -NonInteractive
+            if ($LASTEXITCODE -ne 0) { throw "nuget install $id failed ($LASTEXITCODE)" }
+          }
 
       - name: Build, sign and stage
         shell: pwsh
