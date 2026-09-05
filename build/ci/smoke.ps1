@@ -217,22 +217,54 @@ if ($Verifier) {
     #
     # This runs after the driver has loaded, because DIF instruments a running
     # driver rather than arranging for a future one to be verified.
+    # The help documents the no-reboot form as '/dif [classes] /now', with no
+    # mention of /driver, and passing /driver alongside it fails silently. So
+    # the driver list may need configuring separately from the activation.
+    # Rather than guess, try the plausible shapes in order and let
+    # `verifier /query` decide which one actually took - arming and verifying
+    # are different things, and a silently ineffective Verifier is worse than
+    # none, because every later check would pass and appear to mean something
+    # it does not.
     $classes = @('1', '2', '4', '5', '6', '8', '9', '12', '18', '20')
-    $armed = $false
-    foreach ($verb in '/dif', '/rc') {
-        verifier $verb @classes '/now' '/driver' 'winvhci.sys' 2>&1 |
-            ForEach-Object { Write-Host "  $_" }
-        if ($LASTEXITCODE -eq 0) { $armed = $true; Write-Host "  armed via $verb"; break }
-        Write-Host "  $verb was refused, trying the next form" -ForegroundColor Yellow
-    }
-    Check 'Driver Verifier accepted the rule classes' { $armed }
 
-    # Arming and verifying are different things, and a silently ineffective
-    # Verifier is worse than none: every later check would pass and appear to
-    # mean something it does not. /query lists what is being verified right now.
-    $query = verifier /query 2>&1 | Out-String
-    Check 'Verifier is actually verifying winvhci.sys' { $query -match '(?i)winvhci' } `
-          'verifier /query does not list the driver, so the rule classes reached nothing'
+    function Test-VerifierArmed {
+        $q = verifier /query 2>&1 | Out-String
+        return [bool]($q -match '(?i)winvhci')
+    }
+
+    function Invoke-Verifier([string[]]$Argv) {
+        Write-Host "  verifier $($Argv -join ' ')"
+        $out = & verifier @Argv 2>&1 | Out-String
+        $rc  = $LASTEXITCODE
+        $first = ($out.Trim() -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+        Write-Host "    exit $rc  $first"
+    }
+
+    # Built as named variables rather than inline. An array of argument arrays
+    # needs the unary comma to stay nested - written inline alongside a + the
+    # whole thing flattens, and every token becomes its own invocation.
+    $difWithDriver = @('/dif') + $classes + @('/now', '/driver', 'winvhci.sys')
+    $rcSelect      = @('/rc')  + $classes + @('/driver', 'winvhci.sys')
+    $difNow        = @('/dif') + $classes + @('/now')
+    $volatileAdd   = @('/volatile', '/adddriver', 'winvhci.sys')
+
+    $strategies = @(
+        @{ name = 'dif with driver';          steps = , $difWithDriver }
+        @{ name = 'rc to select, dif to arm'; steps = @($rcSelect, $difNow) }
+        @{ name = 'dif alone';                steps = , $difNow }
+        @{ name = 'volatile adddriver';       steps = , $volatileAdd }
+    )
+
+    $armedBy = $null
+    foreach ($s in $strategies) {
+        Write-Host "  -- $($s.name) --" -ForegroundColor DarkGray
+        foreach ($step in $s.steps) { Invoke-Verifier $step }
+        if (Test-VerifierArmed) { $armedBy = $s.name; break }
+    }
+
+    Check 'Driver Verifier is verifying winvhci.sys' { $null -ne $armedBy } `
+          'no invocation made verifier /query list the driver'
+    if ($armedBy) { Write-Host "  armed by: $armedBy" -ForegroundColor Green }
 }
 
 Write-Host ''
