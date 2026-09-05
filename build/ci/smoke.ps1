@@ -433,6 +433,7 @@ if ($Verifier -and $Bumble) {
         & (Join-Path $ToolsDir 'abuse-teardown.ps1') `
             -Rounds $AbuseRounds `
             -Bridge (Join-Path $ToolsDir 'vhcibridge.ps1') `
+            -Ctl    (Join-Path $ToolsDir 'vhcictl.ps1') `
             -RemoteHost '127.0.0.1' -Port $BumblePort `
             -Devnode (Join-Path $PSScriptRoot 'vhci-devnode.ps1') `
             -SettleSec 12 -TeardownSec 30

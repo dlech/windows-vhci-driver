@@ -149,7 +149,18 @@ if ($Restart) {
     foreach ($d in $devices) {
         Write-Host "Restarting $($d.InstanceId)"
         pnputil /restart-device $d.InstanceId
-        if ($LASTEXITCODE -ne 0) { throw "pnputil /restart-device exited $LASTEXITCODE" }
+        # 3010 is ERROR_SUCCESS_REBOOT_REQUIRED, and the name is accurate: the
+        # restart happened, but PnP wants a reboot to finish tidying up. It is
+        # the ORDINARY answer when a client is attached, because restarting the
+        # FDO takes the radio PDO with it and that unloads BthPort's whole stack
+        # - which bthserv and the per-user Bluetooth services are holding open,
+        # so the removal is not clean. Nothing is left broken: the device comes
+        # back present and started, which is what the caller should assert.
+        if ($LASTEXITCODE -eq 3010) {
+            Write-Host '  restarted; PnP reports a reboot would be needed to finish cleanup' -ForegroundColor DarkGray
+        } elseif ($LASTEXITCODE -ne 0) {
+            throw "pnputil /restart-device exited $LASTEXITCODE"
+        }
     }
 }
 
