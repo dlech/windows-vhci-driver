@@ -35,7 +35,10 @@
 #   2. Ask for a radio. It appears.
 #   3. The same writes now SUCCEED.
 #   4. A second radio request is refused, matching Linux's -EBADFD.
-#   5. Flooding events loses nothing, and WritesTotal accounts for exactly
+#   5. A malformed control packet is refused the way Linux refuses it: a
+#      trailing tail, a reserved opcode bit, or a quirk bit with no Windows
+#      analogue. winvhci used to accept all four and ignore them.
+#   6. Flooding events loses nothing, and WritesTotal accounts for exactly
 #      what was sent.
 #
 # HISTORY WORTH KNOWING BEFORE CHANGING THIS
@@ -175,6 +178,34 @@ try {
     $secondRadio = Try-Write ([byte[]]@(0xFF, 0x00))
     Assert 'a second radio request is refused' ($secondRadio -ne 0) `
            'a duplicate FF 00 succeeded; Linux answers -EBADFD'
+
+    Write-Host ''
+    Write-Host 'control packet validation, as Linux validates it:' -ForegroundColor Cyan
+
+    # Linux requires the vendor packet to be exactly two bytes: vhci_get_user
+    # pulls the type and the opcode, then rejects anything left over with
+    #     if (skb->len > 0) { kfree_skb(skb); return -EINVAL; }
+    # winvhci accepted a trailing tail and ignored it, so a client's framing
+    # bug looked like it worked.
+    Assert 'a control packet with a trailing tail is refused' `
+           ((Try-Write ([byte[]]@(0xFF, 0x00, 0xDE, 0xAD))) -ne 0) `
+           'FF 00 DE AD was accepted; Linux answers -EINVAL'
+
+    # __vhci_create_device: /* bits 2-5 are reserved (must be zero) */
+    #                       if (opcode & 0x3c) return -EINVAL;
+    Assert 'a reserved opcode bit is refused' `
+           ((Try-Write ([byte[]]@(0xFF, 0x04))) -ne 0) `
+           'opcode 0x04 was accepted; bits 2-5 are reserved'
+
+    # Bits 6 and 7 select HCI_QUIRK_EXTERNAL_CONFIG and HCI_QUIRK_RAW_DEVICE.
+    # Neither has a Windows analogue, so they are refused rather than ignored -
+    # a client that asks for a raw device should not silently get a cooked one.
+    Assert 'the external-config opcode bit is refused' `
+           ((Try-Write ([byte[]]@(0xFF, 0x40))) -ne 0) `
+           'opcode 0x40 was accepted; there is no BTHX external configuration'
+    Assert 'the raw-device opcode bit is refused' `
+           ((Try-Write ([byte[]]@(0xFF, 0x80))) -ne 0) `
+           'opcode 0x80 was accepted; there is no BTHX raw device'
 
     Write-Host ''
     Write-Host "flooding $Packets events" -ForegroundColor Cyan

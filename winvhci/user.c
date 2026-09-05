@@ -337,11 +337,53 @@ Routine Description:
     UCHAR    opcode;
     NTSTATUS status;
 
-    if (Length < 1) {
+    //
+    // EXACTLY one body byte. Linux is strict about this and it costs nothing
+    // to match: vhci_get_user pulls the type and the opcode, then
+    //
+    //     if (skb->len > 0) { kfree_skb(skb); return -EINVAL; }
+    //
+    // so FF 00 DE AD is an error there. Accepting it here and ignoring the
+    // tail would let a client's framing bug look like it worked.
+    //
+    if (Length != 1) {
+        KdPrint(("winvhci: control packet is %u body bytes, expected 1\n", Length));
         return STATUS_INVALID_PARAMETER;
     }
 
     opcode = Body[0];
+
+    //
+    // Opcode bits, per __vhci_create_device:
+    //
+    //     /* bits 2-5 are reserved (must be zero) */
+    //     if (opcode & 0x3c)
+    //             return -EINVAL;
+    //     /* bit 6 is for external configuration */
+    //     if (opcode & 0x40) hci_set_quirk(hdev, HCI_QUIRK_EXTERNAL_CONFIG);
+    //     /* bit 7 is for raw device */
+    //     if (opcode & 0x80) hci_set_quirk(hdev, HCI_QUIRK_RAW_DEVICE);
+    //
+    // Bits 0-1 are neither validated nor used on Linux either - a legacy
+    // device type - and are echoed back in the reply, so they pass through.
+    //
+    if ((opcode & 0x3C) != 0) {
+        KdPrint(("winvhci: control: reserved opcode bits set (0x%02x)\n", opcode));
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // The two quirk bits are REFUSED rather than ignored. Neither has a
+    // Windows analogue - there is no BTHX equivalent of external
+    // configuration or of a raw device - and silently ignoring them would
+    // hand a client that asked for a raw device an ordinary one with no
+    // indication that its request went nowhere. Refusing says so.
+    //
+    if ((opcode & 0xC0) != 0) {
+        KdPrint(("winvhci: control: opcode 0x%02x asks for a quirk with no "
+                 "Windows analogue\n", opcode));
+        return STATUS_NOT_SUPPORTED;
+    }
 
     WdfSpinLockAcquire(Ctx->Lock);
     if (Ctx->RadioPresent) {
