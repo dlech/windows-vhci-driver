@@ -387,12 +387,29 @@ if ($Bumble) {
         # event-driven watcher is silent here for reasons that have nothing to
         # do with the driver. FindAllAsync performs a real scan and returns a
         # collection, so it is the check that can actually fail meaningfully.
+        # Scanned more than once deliberately. FindAllAsync is ONE bounded scan
+        # window, so whether it sees the peer depends on an advertising interval
+        # lining up with a scan window - and when it does not, it returns an
+        # empty collection rather than an error. That produced a single x64
+        # failure while every other adapter assertion in the same run passed and
+        # ARM64 passed this one, which is a flake in the assertion rather than
+        # anything the driver did.
+        #
+        # Retrying does not weaken the check: a driver that cannot carry
+        # advertising reports fails all three attempts just as it failed one.
         Check 'Windows discovers the advertising peer' {
             $sel = [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($false)
-            $found = Await ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($sel)) `
-                           ([Windows.Devices.Enumeration.DeviceInformationCollection]) 90000
-            foreach ($d in $found) { Write-Host "    '$($d.Name)'  $($d.Id)" }
-            @($found | Where-Object { $_.Name -eq 'BumblePeer' -or $_.Id -match 'aa:bb:cc:dd:ee:ff' }).Count -gt 0
+            foreach ($attempt in 1..3) {
+                $found = Await ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($sel)) `
+                               ([Windows.Devices.Enumeration.DeviceInformationCollection]) 90000
+                foreach ($d in $found) { Write-Host "    [$attempt] '$($d.Name)'  $($d.Id)" }
+                if (@($found | Where-Object { $_.Name -eq 'BumblePeer' -or $_.Id -match 'aa:bb:cc:dd:ee:ff' }).Count -gt 0) {
+                    return $true
+                }
+                Write-Host "    [$attempt] nothing found; scanning again" -ForegroundColor DarkGray
+                Start-Sleep -Seconds 3
+            }
+            return $false
         } 'the peer advertises from a random address; --peer-address-type public stops discovery working'
     }
     finally {
