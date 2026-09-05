@@ -43,6 +43,7 @@ __all__ = [
     'REMOTE_COMPANY_ID',
     'RawReturnParameters',
     'WindowsCompatController',
+    'SUPERSEDED_HANDLERS',
     'WindowsCompatLink',
     'apply_dual_mode',
 ]
@@ -422,6 +423,46 @@ class WindowsCompatController(Controller):
         return hci.HCI_Read_Inquiry_Response_Transmit_Power_Level_ReturnParameters(
             status=hci.HCI_ErrorCode.SUCCESS, tx_power=0
         )
+
+
+def _drop_handlers_bumble_now_implements() -> list[str]:
+    """Remove any stub that Bumble has since grown a real implementation for.
+
+    Every handler on :class:`WindowsCompatController` exists because Bumble did
+    not implement that command and one "Unknown HCI Command" reply makes
+    BthPort restart initialisation forever. That is a moving target: Bumble
+    keeps adding commands, and a stub left in place after Bumble implements the
+    real thing does not become merely redundant, it *shadows* it.
+
+    That is not hypothetical. By 0.0.234 Bumble implemented five of these, and
+    four of the five keep state the stubs silently discarded::
+
+        write_simple_pairing_mode              updates lmp_features
+        write_local_name                       stores local_name
+        write_scan_enable                      stores classic_scan_enable
+        write_synchronous_flow_control_enable  stores sync_flow_control
+
+    Windows sends all of those during bring-up, so the controller was quietly
+    disagreeing with itself about its own state.
+
+    Doing this at import time rather than deleting the stubs outright is what
+    keeps the older Bumble working: on 0.0.226 the base class has none of them
+    and every stub stays. Which of the two you get is then a fact about the
+    installed Bumble rather than a decision frozen into this file - and the
+    version matrix in CI covers both.
+    """
+    dropped = []
+    for name in list(vars(WindowsCompatController)):
+        if name.startswith('on_hci_') and hasattr(Controller, name):
+            delattr(WindowsCompatController, name)
+            dropped.append(name)
+    return sorted(dropped)
+
+
+#: Handlers removed because the installed Bumble implements them itself.
+#: Exposed so a test can assert this file is not shadowing Bumble, and so the
+#: list is visible rather than being an invisible import-time side effect.
+SUPERSEDED_HANDLERS = _drop_handlers_bumble_now_implements()
 
 
 # A realistic dual-mode LMP feature mask, page 0, as reported by a commodity

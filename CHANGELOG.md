@@ -12,6 +12,16 @@ the supported runner images.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-05
+
+### Fixed
+
+- The `winvhci` package version is single-sourced from
+  `winvhci.__version__`. v1.1.0 shipped distribution metadata saying 1.0.2.
+- `winvhci.bumble_compat` no longer shadows HCI handlers Bumble implements
+  itself. Five stubs stood in front of real implementations, four of which
+  keep state the stubs discarded.
+
 ## [1.1.0] - 2026-09-05
 
 ### Changed

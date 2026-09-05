@@ -4,7 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "winvhci"
-version = "1.0.2"
+# Single-sourced from winvhci/__init__.py. Carrying the number in both
+# places meant they could disagree, and they promptly did: 1.1.0 was
+# tagged with this still reading 1.0.2, so the package built from that
+# tag announced the wrong version.
+dynamic = ["version"]
 description = "Userspace client and Bumble transport for the winvhci virtual Bluetooth HCI controller on Windows"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,6 +36,9 @@ test = ["pytest>=8", "pytest-asyncio>=0.24"]
 [project.urls]
 Homepage = "https://github.com/dlech/windows-vhci-driver"
 Issues = "https://github.com/dlech/windows-vhci-driver/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "winvhci.__version__" }
 
 [tool.setuptools]
 packages = ["winvhci"]

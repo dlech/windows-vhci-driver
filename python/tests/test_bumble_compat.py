@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import pytest
 
+import bumble
 from bumble import hci
 from bumble.controller import Controller
 
 from winvhci.bumble_compat import (
     DUAL_MODE_LMP_FEATURES,
+    SUPERSEDED_HANDLERS,
     WindowsCompatController,
     WindowsCompatLink,
     apply_dual_mode,
@@ -171,3 +173,45 @@ def test_the_windows_handlers_are_present():
         'on_hci_read_inquiry_response_transmit_power_level_command',
     ):
         assert hasattr(WindowsCompatController, name), f'{name} is missing'
+
+
+def test_no_handler_shadows_bumbles_own():
+    """The shim must never stand in front of a real Bumble implementation.
+
+    Every handler here is a stub that answers with a status and stores nothing,
+    which is the correct thing to do for a command Bumble does not implement
+    and the wrong thing to do for one it does. By 0.0.234 Bumble had
+    implemented five of them for real, and four of those five keep state the
+    stubs discarded - write_simple_pairing_mode updates lmp_features,
+    write_local_name stores local_name, write_scan_enable stores
+    classic_scan_enable, write_synchronous_flow_control_enable stores
+    sync_flow_control. Windows sends all four during bring-up.
+
+    The module drops such stubs at import time, so this asserts the outcome
+    rather than the mechanism: whatever Bumble is installed, nothing in this
+    package is hiding it.
+    """
+    shadowing = sorted(
+        name
+        for name in vars(WindowsCompatController)
+        if name.startswith('on_hci_') and hasattr(Controller, name)
+    )
+    assert not shadowing, (
+        f'these stubs shadow Bumble {bumble.__version__} implementations: '
+        f'{shadowing}'
+    )
+
+
+def test_superseded_handlers_are_actually_bumbles():
+    """Whatever was dropped must really exist on Bumble's controller.
+
+    Guards the drop from going too far: an over-eager rule that removed a
+    handler Bumble does not implement would put back the original failure -
+    BthPort restarting its initialisation forever on one "Unknown HCI Command"
+    - and it would only show up on Windows.
+    """
+    for name in SUPERSEDED_HANDLERS:
+        assert hasattr(Controller, name), (
+            f'{name} was dropped as superseded, but Bumble '
+            f'{bumble.__version__} does not implement it'
+        )

@@ -64,3 +64,10 @@ packages/
 # Staged CI artifacts
 out/
 artifacts/
+
+# Python packaging artifacts from building the winvhci client in place.
+# python/build/ is spelled out rather than a bare build/, which would
+# swallow this repository's own tracked build/ directory.
+python/build/
+*.egg-info/
+.pytest_cache/
