@@ -29,6 +29,12 @@ param(
     # Bluetooth stack on top and discovers an advertising peer.
     [switch]$Bumble,
     [string]$Python = 'python',
+
+    # Tier 3: run the whole thing under Driver Verifier, then abuse the teardown
+    # path, which docs/implementation-plan.md still lists as the open risk.
+    [switch]$Verifier,
+    [int]   $AbuseRounds = 3,
+
     [int]   $BumblePort = 6402,
     # Only a backstop. The bridge is killed explicitly when the tier finishes;
     # this has to comfortably outlast the assertions, because if it expires
@@ -138,6 +144,36 @@ foreach ($store in 'Root', 'TrustedPublisher') {
     Write-Host "  added to LocalMachine\$store"
 }
 
+if ($Verifier) {
+    Write-Host ''
+    Write-Host '=== Arming Driver Verifier ===' -ForegroundColor Cyan
+
+    # /volatile, not /standard. The documented local flow is
+    # `verifier /standard /driver winvhci.sys` followed by a reboot, and a CI
+    # job cannot reboot. Volatile settings take effect immediately and apply to
+    # drivers loaded afterwards - which is why this runs BEFORE the devnode is
+    # created and the driver loads.
+    #
+    # 0x209BB is the standard set: special pool, force IRQL checking, pool
+    # tracking, I/O verification, deadlock detection, DMA checking, security
+    # checks, miscellaneous checks and DDI compliance.
+    #
+    # Low resources simulation (0x4) is deliberately absent. It has already been
+    # measured not to reach this driver at all - at probability 100% it failed
+    # none of 24 allocations, because both allocation sites call
+    # ExAllocatePool2 while holding the FDO spinlock at DISPATCH_LEVEL. The
+    # WvFailAllocOneIn registry knob is what exercises those paths.
+    $applied = $null
+    foreach ($mask in '0x209BB', '0x9BB') {
+        verifier /volatile /adddriver winvhci.sys /flags $mask 2>&1 | ForEach-Object { Write-Host "  $_" }
+        if ($LASTEXITCODE -eq 0) { $applied = $mask; break }
+        Write-Host "  flags $mask rejected, trying a smaller set" -ForegroundColor Yellow
+    }
+    Check 'Driver Verifier accepted volatile settings' { $null -ne $applied } `
+          'neither the standard flag set nor the set without DDI compliance applied'
+    if ($applied) { Write-Host "  armed with flags $applied" }
+}
+
 Write-Host ''
 Write-Host '=== Installing ===' -ForegroundColor Cyan
 
@@ -179,6 +215,16 @@ if ($fdo) { Write-Host "  $($fdo.InstanceId)  '$($fdo.FriendlyName)'" }
 Check 'FDO reaches Status OK' {
     Wait-For 'FDO Status=OK' { (Get-Fdo) -and (Get-Fdo).Status -eq 'OK' } 30
 } "status was '$(if ($fdo) { $fdo.Status })', problem '$(if ($fdo) { $fdo.Problem })'"
+
+if ($Verifier) {
+    # Arming Verifier and having it actually verify are different things, and a
+    # silently ineffective Verifier is worse than none: every later check passes
+    # and appears to mean something it does not. /query lists the modules being
+    # verified right now, so it can only say yes once the driver has loaded.
+    $query = verifier /query 2>&1 | Out-String
+    Check 'Verifier is actually verifying winvhci.sys' { $query -match '(?i)winvhci\.sys' } `
+          'verifier /query does not list the driver, so the flags reached nothing'
+}
 
 Write-Host ''
 Write-Host '=== The radio, while a client holds the handle ===' -ForegroundColor Cyan
@@ -351,6 +397,53 @@ if ($Bumble) {
     } 'the bridge is killed outright, so this is the abrupt-client-death path'
 }
 
+if ($Verifier -and $Bumble) {
+    Write-Host ''
+    Write-Host '=== Tier 3: teardown abuse, under Verifier ===' -ForegroundColor Cyan
+
+    # A client dying abruptly is the NORMAL case here, not an edge case: the
+    # radio's lifetime is a file handle's lifetime. When it dies the driver has
+    # to complete BTHX reads the stack has pended, purge both backlogs and tear
+    # the PDO down, all while the stack may still be issuing WRITE_HCI. That is
+    # the race most likely to bugcheck, and a well-behaved session never touches
+    # it - which is exactly why it needs its own tier rather than trusting the
+    # clean shutdown Tier 2 performs.
+    $controller = Start-Process $Python -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path (Get-Location) 'bumble.abuse.log') `
+        -RedirectStandardError  (Join-Path (Get-Location) 'bumble.abuse.err.log') `
+        -ArgumentList @((Join-Path $ToolsDir 'bumble-controller.py'),
+                        '--peer', '--dual-mode', '--host', '127.0.0.1', '--port', "$BumblePort")
+    $null = $controller.Handle
+    try {
+        Wait-For 'the controller to listen' {
+            (Test-Path 'bumble.abuse.log') -and
+            (Select-String -Path 'bumble.abuse.log' -Pattern 'listening for an HCI client' -Quiet)
+        } 60 | Out-Null
+
+        & (Join-Path $ToolsDir 'abuse-teardown.ps1') `
+            -Rounds $AbuseRounds `
+            -Bridge (Join-Path $ToolsDir 'vhcibridge.ps1') `
+            -RemoteHost '127.0.0.1' -Port $BumblePort `
+            -Devnode (Join-Path $PSScriptRoot 'vhci-devnode.ps1') `
+            -SettleSec 12 -TeardownSec 30
+        $abuseRc = $LASTEXITCODE
+        Check 'teardown abuse leaves no stale radio' { $abuseRc -eq 0 } `
+              "abuse-teardown.ps1 exited $abuseRc"
+    }
+    finally {
+        if ($controller -and -not $controller.HasExited) {
+            $controller.Kill(); $controller.WaitForExit(10000) | Out-Null
+        }
+    }
+
+    # Verifier reports a bugcheck by bugchecking, so surviving is most of the
+    # signal - but the counters say whether it was doing anything, and a run
+    # where nothing was allocated proves nothing about pool handling.
+    Write-Host ''
+    Write-Host '--- verifier /query ---' -ForegroundColor DarkGray
+    verifier /query 2>&1 | ForEach-Object { Write-Host "  $_" }
+}
+
 Write-Host ''
 Write-Host '=== Bugcheck check ===' -ForegroundColor Cyan
 # A bugcheck during teardown that a successful reconnect papers over is exactly
@@ -379,6 +472,13 @@ pnputil /enum-drivers | ForEach-Object {
 }
 
 Check 'nothing winvhci remains' { -not (Get-Fdo) -and -not (Get-Radio) }
+
+if ($Verifier) {
+    # Volatile settings do not survive a reboot, but the runner is not going to
+    # reboot - and leaving verification armed for a driver that has just been
+    # uninstalled is a booby trap for anything that runs after this.
+    verifier /volatile /removedriver winvhci.sys 2>&1 | ForEach-Object { Write-Host "  $_" }
+}
 
 Write-Host ''
 $total = $script:checks.Count

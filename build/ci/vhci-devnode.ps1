@@ -17,9 +17,10 @@
 
 [CmdletBinding(DefaultParameterSetName = 'Create')]
 param(
-    [Parameter(ParameterSetName = 'Create', Mandatory)] [switch]$Create,
-    [Parameter(ParameterSetName = 'Create', Mandatory)] [string]$Inf,
-    [Parameter(ParameterSetName = 'Remove', Mandatory)] [switch]$Remove,
+    [Parameter(ParameterSetName = 'Create',  Mandatory)] [switch]$Create,
+    [Parameter(ParameterSetName = 'Create',  Mandatory)] [string]$Inf,
+    [Parameter(ParameterSetName = 'Remove',  Mandatory)] [switch]$Remove,
+    [Parameter(ParameterSetName = 'Restart', Mandatory)] [switch]$Restart,
     [string]$HardwareId = 'root\winvhci'
 )
 
@@ -126,14 +127,33 @@ if ($Create) {
     if ($reboot) { Write-Warning 'Windows asked for a reboot, which is unexpected for a fresh node.' }
 }
 
-if ($Remove) {
+if ($Remove -or $Restart) {
     # Match on the hardware ID rather than a friendly name so this keeps working
     # if the INF's device description changes.
-    $devices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+    $devices = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object {
         $ids = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_HardwareIds' `
                     -ErrorAction SilentlyContinue).Data
         $ids -and ($ids -contains $HardwareId)
     }
+}
+
+if ($Restart) {
+    # Equivalent to `devcon restart root\winvhci`, without needing devcon.
+    # pnputil grew /restart-device in Windows 10 1903.
+    #
+    # This is the harshest thing that can be done to a live driver short of
+    # unplugging hardware: the FDO is pulled out from under whatever client
+    # holds \\.\WinVhci, so the child PDO and every pended BTHX request have to
+    # be torn down while userspace still has the handle open.
+    if (-not $devices) { throw "No present device with hardware ID $HardwareId to restart." }
+    foreach ($d in $devices) {
+        Write-Host "Restarting $($d.InstanceId)"
+        pnputil /restart-device $d.InstanceId
+        if ($LASTEXITCODE -ne 0) { throw "pnputil /restart-device exited $LASTEXITCODE" }
+    }
+}
+
+if ($Remove) {
     if (-not $devices) {
         Write-Host "No device with hardware ID $HardwareId is present."
     }
