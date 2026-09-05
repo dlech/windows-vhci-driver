@@ -265,31 +265,18 @@ Routine Description:
         PWINVHCI_PACKET p;
 
         //
-        // Backpressure rather than loss. The producer is the userspace client,
-        // so it can be made to wait: STATUS_PENDING tells the write path to
-        // park its WDFREQUEST on WriteWaitQueue, and WinVhciDrainWriteWaiters
-        // releases it when the stack takes a packet off this list.
+        // No bound, and no drop. This list is the counterpart of hdev->rx_q on
+        // Linux, which hci_recv_frame appends to with no capacity check, no
+        // drop threshold and no blocking, so a client written against
+        // /dev/vhci meets the same flow control here.
         //
-        // This used to drop the packet and fail the write with
-        // STATUS_INSUFFICIENT_RESOURCES. Failing the write is at least visible,
-        // but it is visible in the wrong place: a Bumble sink pump treats any
-        // write exception as fatal and stops sending forever, so one transient
-        // full backlog silently ends the session.
+        // What makes an unbounded queue safe to have is the admission check
+        // above it: WinVhciDispatchWrite has already refused this write with
+        // STATUS_DEVICE_NOT_READY if no radio exists, mirroring Linux's
+        // -ENODEV. Without that, this list is where packets go to be
+        // forgotten - queued with no stack to drain them, then replayed into
+        // the bring-up of a radio that did not exist when they were sent.
         //
-        if (*count >= WINVHCI_MAX_BACKLOG) {
-            //
-            // Deliberately NOT counted in WritesTotal. This write is going to
-            // be pended and dispatched again, and counting it on both passes
-            // would make the total exceed what userspace actually sent -
-            // which is precisely the number the other counters are read
-            // against.
-            //
-            WdfSpinLockRelease(Ctx->Lock);
-            KdPrint(("winvhci: stack backlog full (%u), pending the write of type 0x%02x\n",
-                     *count, Type));
-            return STATUS_PENDING;
-        }
-
         p = WinVhciTestFailAlloc(Ctx)
                 ? NULL
                 : (PWINVHCI_PACKET)ExAllocatePool2(

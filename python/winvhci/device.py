@@ -68,13 +68,9 @@ _WAIT_FAILED = 0xFFFFFFFF
 #: mechanism; it only bounds how long a reader can outlive its device.
 _READ_POLL_MS = 250
 
-#: Bound on a write. The driver queues a write and completes it, so this only
+#: Bound on a write. The driver never pends a write - its backlogs are
+#: unbounded and every path either completes or fails outright - so this only
 #: exists so a wedged device fails rather than hanging a test forever.
-#:
-#: A write can now legitimately take a while: when the controller-to-host
-#: backlog is full the driver pends the write instead of failing it, and
-#: completes it once the Bluetooth stack drains one packet. So this timeout is
-#: the boundary between "backpressure" and "the stack stopped reading".
 _WRITE_TIMEOUT_MS = 5000
 
 
@@ -120,8 +116,7 @@ class _WINVHCI_STATS(ctypes.Structure):
         ('PendingDataPeak', wintypes.ULONG),
         ('WritesTotal', wintypes.ULONG),
         ('QueuedToUserTotal', wintypes.ULONG),
-        ('WritesPended', wintypes.ULONG),
-        ('WritesWaiting', wintypes.ULONG),
+        ('WritesNoRadio', wintypes.ULONG),
     ]
 
 
@@ -155,18 +150,17 @@ class VhciStats:
     pending_data_count: int
     pending_data_peak: int
 
-    #: Totals moved each way. These are the denominators: without them a flat
-    #: :attr:`writes_pended` is ambiguous between "userspace sent nothing" and
-    #: "userspace sent plenty and the stack kept up".
+    #: Totals moved each way, and the denominators for everything above.
+    #: Without them a depth of zero is ambiguous between "nothing was sent" and
+    #: "everything was sent and the far side kept up".
     writes_total: int
     queued_to_user_total: int
 
-    #: How many userspace writes have been pended for backpressure in total,
-    #: and how many are waiting right now. A rising total with a healthy stack
-    #: is normal; a persistently non-zero :attr:`writes_waiting` means the
-    #: stack stopped draining.
-    writes_pended: int
-    writes_waiting: int
+    #: Writes refused because no radio existed yet - the driver's equivalent of
+    #: Linux vhci's ``-ENODEV``. A client that requests its radio before
+    #: sending anything, as :mod:`winvhci.transport` does, never increments
+    #: this.
+    writes_no_radio: int
 
     @property
     def total_drops(self) -> int:
@@ -185,8 +179,7 @@ class VhciStats:
             pending_data_peak=raw.PendingDataPeak,
             writes_total=raw.WritesTotal,
             queued_to_user_total=raw.QueuedToUserTotal,
-            writes_pended=raw.WritesPended,
-            writes_waiting=raw.WritesWaiting,
+            writes_no_radio=raw.WritesNoRadio,
         )
 
 

@@ -14,18 +14,19 @@ the supported runner images.
 
 ### Changed
 
-- The driver no longer drops packets when a backlog is full. Userspace writes
-  are pended for backpressure; the stack-to-userspace direction, whose producer
-  cannot be told to wait, is unbounded.
+- Backlogs are unbounded and never drop, matching Linux `/dev/vhci`.
 
 ### Added
 
 - `IOCTL_WINVHCI_GET_STATS`, exposed as `VhciDevice.stats()` and
   `vhcibridge.ps1 -Stats`, so packet loss is measurable rather than invisible.
-- `tools/test-backpressure.ps1`, which proves writes pend and none are lost.
+- `tools/test-write-gating.ps1`, run by the smoke test.
 
 ### Fixed
 
+- An event or ACL write sent before the radio is requested is now refused with
+  `STATUS_DEVICE_NOT_READY`, mirroring Linux's `-ENODEV`. It used to be queued
+  and then replayed into the new radio's bring-up.
 - `vhci-io.ps1` ignored its own write timeout and could block forever.
 - `vhcibridge.ps1` mis-reported a burst larger than its 8 KB reassembly buffer
   as a malformed stream.
