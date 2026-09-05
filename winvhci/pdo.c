@@ -61,10 +61,67 @@ WinVhciPdoEvtD0Entry(
     _In_ WDF_POWER_DEVICE_STATE PreviousState
     )
 {
-    UNREFERENCED_PARAMETER(Device);
+    PWINVHCI_PDO_CONTEXT pdoCtx = WinVhciPdoGetContext(Device);
+    PWINVHCI_FDO_CONTEXT ctx    = WinVhciFdoGetContext(pdoCtx->Fdo);
+
     UNREFERENCED_PARAMETER(PreviousState);
 
+    WdfSpinLockAcquire(ctx->Lock);
+    ctx->RadioStarted = TRUE;
+    WdfSpinLockRelease(ctx->Lock);
+
     KdPrint(("winvhci: pdo D0 entry\n"));
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+WinVhciPdoEvtD0Exit(
+    _In_ WDFDEVICE              Device,
+    _In_ WDF_POWER_DEVICE_STATE TargetState
+    )
+/*++
+
+Routine Description:
+
+    The radio's stack has stopped consuming. This is winvhci's HCI_UP going
+    false, and it is what lets a write be refused instead of queued against
+    nothing.
+
+    MEASURED, with a radio whose controller never answered. BthPort sends
+    HCI_Reset, retries once four seconds later, and at twelve seconds gives up:
+
+        12.055626  READ_HCI CANCELED on the event queue
+        12.055668  READ_HCI CANCELED on the acl queue
+        12.055675  READ_HCI CANCELED on the acl queue
+        12.056305  pdo SURPRISE REMOVAL
+        12.056318  pdo SELF-MANAGED IO SUSPEND
+        12.056324  pdo D0 EXIT, target state 5
+
+    all of it two full seconds before the client's next write arrived. The
+    driver was never in the dark; it simply had no D0Exit registered to hear
+    it.
+
+    "target state 5" is WdfPowerDeviceD3Final - the device leaving the working
+    state D0 for good, rather than an ordinary powered-down D3 it could come
+    back from. Any of the three callbacks above would catch this particular
+    case, but D0Exit is the one that is ALSO right for a system sleep, where
+    the stack equally stops consuming and there is a matching D0Entry to turn
+    RadioStarted back on afterwards. Surprise removal has no such pairing.
+
+    The backlogs are dropped here for the same reason Linux's vhci_flush and
+    vhci_close_dev purge readq when the hdev goes down: whatever is queued was
+    meant for a stack that is no longer there, and keeping it would replay
+    stale packets into the next bring-up.
+
+--*/
+{
+    PWINVHCI_PDO_CONTEXT pdoCtx = WinVhciPdoGetContext(Device);
+
+    KdPrint(("winvhci: pdo D0 exit (target %d); the stack has stopped consuming\n",
+             TargetState));
+
+    WinVhciRadioStackDown(WinVhciFdoGetContext(pdoCtx->Fdo));
 
     return STATUS_SUCCESS;
 }
@@ -216,6 +273,7 @@ WinVhciEvtChildListCreateDevice(
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpCallbacks);
     pnpCallbacks.EvtDevicePrepareHardware = WinVhciPdoEvtPrepareHardware;
     pnpCallbacks.EvtDeviceD0Entry         = WinVhciPdoEvtD0Entry;
+    pnpCallbacks.EvtDeviceD0Exit          = WinVhciPdoEvtD0Exit;
     WdfDeviceInitSetPnpPowerEventCallbacks(ChildInit, &pnpCallbacks);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, WINVHCI_PDO_CONTEXT);

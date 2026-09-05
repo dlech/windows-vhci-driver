@@ -81,6 +81,39 @@ WinVhciFreeList(
 }
 
 VOID
+WinVhciRadioStackDown(
+    _In_ PWINVHCI_FDO_CONTEXT Ctx
+    )
+/*++
+
+Routine Description:
+
+    The radio PDO has left D0, so the Bluetooth stack above it has stopped
+    consuming. Called from the PDO's EvtDeviceD0Exit.
+
+    Clearing RadioStarted is what makes the next write fail with
+    STATUS_DEVICE_NOT_READY instead of queueing against nothing - winvhci's
+    equivalent of hci_recv_frame refusing with -ENXIO when HCI_UP is clear.
+
+    The two userspace -> stack backlogs go with it, for the reason Linux's
+    vhci_flush and vhci_close_dev purge readq when the hdev goes down: what is
+    queued was meant for a stack that is gone, and keeping it would replay
+    stale packets into the next bring-up.
+
+    HostToCtrlList is deliberately NOT dropped. It runs the other way - it
+    holds packets the stack already handed us for the client to read - and the
+    client is still there and still entitled to them.
+
+--*/
+{
+    WdfSpinLockAcquire(Ctx->Lock);
+    Ctx->RadioStarted = FALSE;
+    WinVhciFreeList(&Ctx->PendingEventList, &Ctx->PendingEventCount);
+    WinVhciFreeList(&Ctx->PendingDataList,  &Ctx->PendingDataCount);
+    WdfSpinLockRelease(Ctx->Lock);
+}
+
+VOID
 WinVhciPurgeBacklogs(
     _In_ PWINVHCI_FDO_CONTEXT Ctx
     )
@@ -491,18 +524,40 @@ Routine Description:
         // advertising reports were all delivered the instant the radio
         // appeared.
         //
-        // Checked without the lock. RadioPresent only ever goes FALSE from
-        // EvtFileClose, which cannot run concurrently with a write on the same
-        // handle, so a torn read is not reachable from here.
+        // Linux checks TWICE, and so does this. The second check is the one
+        // that was missing longest:
         //
-        if (!ctx->RadioPresent) {
+        //     hci_recv_frame() -> if (!hdev || (!test_bit(HCI_UP, &hdev->flags)
+        //                             && !test_bit(HCI_INIT, &hdev->flags)))
+        //                                 return -ENXIO;
+        //
+        // RadioPresent answers "has the client asked for a radio". It stays
+        // TRUE through a failed bring-up, so on its own it admits writes into
+        // a radio whose stack has given up - measured at 300 packets queued
+        // with nothing draining, and unbounded because nothing bounds it.
+        // RadioStarted answers "is that radio's stack actually consuming",
+        // and the PDO's EvtDeviceD0Exit clears it.
+        //
+        // Under the lock, because unlike RadioPresent this one is changed by
+        // PnP on another thread entirely.
+        //
+        {
+            BOOLEAN ready;
+
             WdfSpinLockAcquire(ctx->Lock);
-            ctx->WritesNoRadio++;
+            ready = ctx->RadioPresent && ctx->RadioStarted;
+            if (!ready) {
+                ctx->WritesNoRadio++;
+            }
             WdfSpinLockRelease(ctx->Lock);
-            KdPrint(("winvhci: type 0x%02x written before a radio was requested\n",
-                     type));
-            status = STATUS_DEVICE_NOT_READY;
-            break;
+
+            if (!ready) {
+                KdPrint(("winvhci: type 0x%02x refused, no radio is up "
+                         "(present %d, started %d)\n",
+                         type, ctx->RadioPresent, ctx->RadioStarted));
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
         }
 
         status = WinVhciDeliverToStack(ctx, type, buffer + 1, (ULONG)bufferLength - 1);

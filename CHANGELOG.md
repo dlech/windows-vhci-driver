@@ -30,6 +30,9 @@ the supported runner images.
 - A control packet with a trailing tail, a reserved opcode bit, or an opcode
   bit selecting a quirk with no Windows analogue is now refused rather than
   silently ignored.
+- Writes are refused once the radio's stack stops consuming, mirroring Linux's
+  `-ENXIO`, and the stale backlog is dropped. They used to queue without limit
+  against a radio whose bring-up had failed.
 - `vhci-io.ps1` ignored its own write timeout and could block forever.
 - `vhcibridge.ps1` mis-reported a burst larger than its 8 KB reassembly buffer
   as a malformed stream.
