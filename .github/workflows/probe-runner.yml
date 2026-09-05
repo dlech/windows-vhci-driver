@@ -1,0 +1,88 @@
+# Step 0: find out what GitHub's Windows runners can actually do.
+#
+# Two questions decide the whole CI design for this driver, and neither can be
+# answered from documentation:
+#
+#   1. Is `testsigning` already on?  Every Windows runner image has run
+#      `bcdedit /set TESTSIGNING ON` at image build time since 2021, and it is
+#      asserted by an image validation test.  If that holds, a test-signed
+#      winvhci.sys can be installed directly on a runner and the whole
+#      QEMU-guest-on-a-Linux-runner design is unnecessary.
+#
+#   2. Does the runner have the Bluetooth stack, and can WinRT reach it from a
+#      non-interactive session?  `bth.inf` is what binds BthMini + BthPort to
+#      our radio PDO.  Windows Server historically has no Bluetooth stack at
+#      all, so this is expected to separate the client image (windows-11-arm)
+#      from the Server ones - but Server 2025 reportedly added it, which would
+#      widen the options considerably.  Nobody appears to have ever checked.
+#
+# Deliberately read-only: it installs nothing and builds nothing, so it can be
+# run against any label without risk.  Each leg always exits 0 - a missing
+# feature is a finding, not a failure.
+
+name: probe-runner
+
+on:
+  workflow_dispatch:
+  # Also run on pushes that touch the probe itself, so iterating on it does not
+  # need a manual trigger every time.
+  push:
+    paths:
+      - '.github/workflows/probe-runner.yml'
+      - 'build/ci/probe-runner.ps1'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          # Windows 11 client, arm64. The only free client SKU, and the one
+          # that should have the Bluetooth stack. `windows-11-arm` is in the
+          # process of moving to the VS2026 image, so probe both labels.
+          - windows-11-arm
+          - windows-11-vs2026-arm
+          # Windows Server. `windows-latest`, `windows-2025` and
+          # `windows-2025-vs2026` are currently the same image; 2022 is the one
+          # msquic loads test-signed kernel drivers on today.
+          - windows-2025
+          - windows-2022
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Probe
+        # Windows PowerShell 5.1, NOT pwsh: PowerShell 7 dropped the
+        # WindowsRuntime type accelerator, so the WinRT checks are meaningless
+        # under `shell: pwsh`. Verified on a dev machine - under pwsh every
+        # WinRT probe reports "Unable to find type".
+        shell: powershell
+        run: |
+          .\build\ci\probe-runner.ps1 -Json "probe-${{ matrix.runner }}.json" |
+            Tee-Object -FilePath "probe-${{ matrix.runner }}.txt"
+
+      - name: Publish to the job summary
+        if: always()
+        shell: powershell
+        run: |
+          $f = "probe-${{ matrix.runner }}.txt"
+          "## ${{ matrix.runner }}"              | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```'                                  | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if (Test-Path $f) { Get-Content $f | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
+          else { 'probe produced no output'      | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
+          '```'                                  | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-${{ matrix.runner }}
+          path: |
+            probe-*.json
+            probe-*.txt
+          if-no-files-found: warn
