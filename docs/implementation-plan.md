@@ -219,13 +219,26 @@ available.
 
 ### ⬜ M5 — Ergonomics
 
-- Upstream `WindowsCompatController` to Bumble. None of it is specific to this project.
-- A `pip`-installable client, and a Bumble transport that speaks to `\\.\WinVhci` directly so
-  the bridge is not needed.
+- Give the bridge a keepalive or inactivity timeout, so a radio does not outlive a link severed
+  by hibernation. This is the one defect left open by M4.
+- Finish `tools/win-ble-scan.ps1`, the event-driven `BluetoothLEAdvertisementWatcher` check.
+  `FindAllAsync` already demonstrates discovery, so this is a second opinion rather than a gap
+  in the evidence.
 - Narrow down which LE Supported States bits Windows actually requires; the working value is
   empirical.
+- Decide the fate of the registry breadcrumbs — the `WvScoSupport` / `WvMaxScoChannels` /
+  `WvFailAllocOneIn` knobs earn their keep, the per-IOCTL trace writes are redundant now that
+  DebugView works.
+- A `pip`-installable client, and a Bumble transport that speaks to `\\.\WinVhci` directly so
+  the bridge is not needed.
 - BR/EDR beyond initialisation. The dual-mode LMP mask advertises capabilities Bumble cannot
   honour, so BR/EDR operations will fail if anything tries them. LE is the path that works.
+
+**Last, deliberately:** upstream `WindowsCompatController` to Bumble — the missing handlers, the
+`supported_commands` entries, `le_states`, and the `LocalLink` ACL routing fix. None of it is
+specific to this project, but it is outward-facing work in someone else's repository, and every
+further finding against the Windows stack may still change the shim. Sending it early would mean
+revising a public pull request as this project goes on learning things.
 
 ---
 
