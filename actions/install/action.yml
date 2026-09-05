@@ -1,8 +1,14 @@
 # Install the winvhci virtual Bluetooth controller on a GitHub-hosted Windows
 # runner.
 #
-#     - uses: dlech/windows-vhci-driver/actions/install@v1
+#     - uses: dlech/windows-vhci-driver/actions/install@v1.0.0
+#       with:
+#         version: v1.0.0
 #     - run: pytest tests/test_winrt_backend.py
+#
+# Pin the ref, and keep it equal to `version:`. There is no floating `v1` tag to
+# track, because this repository pins the actions it uses by commit SHA and
+# publishing a mutable tag it would not itself consume would be inconsistent.
 #
 # No VM and no secrets. GitHub's Windows runner images run
 # `bcdedit.exe /set TESTSIGNING ON` at image build time and assert it in an
@@ -38,7 +44,7 @@ branding:
 inputs:
   version:
     description: >-
-      Release tag of windows-vhci-driver to install, for example v0.1.0.
+      Release tag of windows-vhci-driver to install, for example v1.0.0.
       Ignored when package-path is set.
     required: false
     default: ''

@@ -71,11 +71,16 @@ no VM and no secrets — GitHub's Windows runner images enable test signing at i
 so a test-signed driver loads directly:
 
 ```yaml
-    - uses: dlech/windows-vhci-driver/actions/install@v1
+    - uses: dlech/windows-vhci-driver/actions/install@v1.0.0
       with:
-        version: v0.1.0
+        version: v1.0.0
     - run: pytest tests/test_bluetooth.py
 ```
+
+There is deliberately no floating `v1` tag to track. This repository pins every action it uses
+by commit SHA and lets Dependabot move the pin, and publishing a mutable tag it would not
+itself consume would be inconsistent — so pin the action ref, and keep it equal to `version:`,
+which is what the release was tested as.
 
 Runs on `windows-2025` and `windows-11-vs2026-arm`. Not `windows-2022`: the driver loads, but
 `Radio.RequestAccessAsync` returns `DeniedByUser` and the user-mode Bluetooth services are
