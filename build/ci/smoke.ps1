@@ -49,7 +49,9 @@ function Check([string]$Name, [scriptblock]$Test, [string]$Detail = '') {
         if ($Detail) { Write-Host "        $Detail" -ForegroundColor DarkGray }
         if ($err)    { Write-Host "        $err"    -ForegroundColor DarkGray }
     }
-    return $ok
+    # Deliberately returns nothing. This is called as a statement, so a return
+    # value would fall out into the output stream and print a bare True/False
+    # under every result line.
 }
 
 # No fixed sleeps anywhere: PnP is asynchronous, and a Start-Sleep long enough
@@ -65,13 +67,17 @@ function Wait-For([string]$What, [scriptblock]$Until, [int]$TimeoutSec = 30) {
     return $false
 }
 
+# -PresentOnly matters. Without it Get-PnpDevice also lists devices that are
+# merely REMEMBERED - phantom nodes left in the registry after removal, whose
+# Status reads Unknown. A teardown assertion written against the unfiltered list
+# can never pass, because the node keeps being reported long after it is gone.
 function Get-Fdo {
-    Get-PnpDevice -ErrorAction SilentlyContinue |
+    Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object { $_.InstanceId -like 'ROOT\SYSTEM\*' -and $_.FriendlyName -like '*Virtual Bluetooth*' } |
         Select-Object -First 1
 }
 function Get-Radio {
-    Get-PnpDevice -ErrorAction SilentlyContinue |
+    Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object { $_.InstanceId -like 'WINVHCI\RADIO*' } |
         Select-Object -First 1
 }
@@ -131,6 +137,10 @@ if (-not $p.WaitForExit(120000)) {
     $p.Kill()
     throw 'pnputil /add-driver hung for 120s - almost certainly a certificate trust problem'
 }
+# The timed WaitForExit overload returns as soon as the process signals, before
+# the Process object has finished collecting its exit state - so ExitCode reads
+# back empty. The parameterless call waits for that to settle.
+$p.WaitForExit()
 $rc = $p.ExitCode
 Get-Content "$env:TEMP\pnputil.log" | ForEach-Object { Write-Host "  $_" }
 
@@ -230,8 +240,8 @@ Check 'nothing winvhci remains' { -not (Get-Fdo) -and -not (Get-Radio) }
 
 Write-Host ''
 $total = $script:checks.Count
-Write-Host "=== $($total - $script:failed)/$total checks passed ===" -ForegroundColor (
-    if ($script:failed) { 'Red' } else { 'Green' })
+$colour = if ($script:failed) { 'Red' } else { 'Green' }
+Write-Host "=== $($total - $script:failed)/$total checks passed ===" -ForegroundColor $colour
 
 if ($Json) {
     [ordered]@{
