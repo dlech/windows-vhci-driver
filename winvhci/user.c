@@ -89,14 +89,25 @@ WinVhciPurgeBacklogs(
     // Pended writes first, and OUTSIDE the lock, by draining the queue by hand
     // rather than purging it.
     //
-    // WdfIoQueuePurgeSynchronously was the obvious choice and it DEADLOCKS
-    // here. One caller of this function is EvtFileClose, and purging
-    // synchronously waits for the queue to drain from inside the very callback
-    // the framework is running for that file object. The symptom is not a hang
-    // anyone would attribute to a queue: the close never finishes, so Owner
-    // stays set and the radio stays alive, and the next CreateFile on an
-    // exclusive device fails with ERROR_ACCESS_DENIED - which reads as a
-    // permissions problem, not as a driver that never let go.
+    // WdfIoQueuePurgeSynchronously was the obvious choice and it DEADLOCKS on
+    // THIS queue. The rule is about which file object owns the requests, not
+    // about EvtFileClose as such:
+    //
+    //   WriteWaitQueue holds writes belonging to the file object being closed.
+    //   The framework's cleanup for that file object is already waiting for
+    //   those requests to complete, so purging synchronously waits on
+    //   something that cannot finish until this callback returns.
+    //
+    //   ReadEventQueue and ReadDataQueue are purged synchronously from
+    //   EvtFileClose too (see WinVhciEvtFileClose) and do NOT hang, because
+    //   they hold BTHX IOCTLs forwarded from BthMini - kernel-mode requests on
+    //   a different file object, which nothing in this close path is waiting
+    //   for. Do not "fix" those two calls to match this one.
+    //
+    // The symptom is not a hang anyone would attribute to a queue: the close
+    // never finishes, so Owner stays set and the radio stays alive, and the
+    // next CreateFile on an exclusive device fails with ERROR_ACCESS_DENIED -
+    // which reads as a permissions problem, not as a driver that never let go.
     //
     // Retrieve-and-complete has none of those constraints, needs no
     // WdfIoQueueStart afterwards because the queue is never stopped, and is
@@ -717,6 +728,12 @@ Routine Description:
     // Release anything the stack is still waiting on, then drop the backlogs.
     // Outstanding BTHX reads must not survive the client that was supposed to
     // answer them.
+    //
+    // Purging synchronously is safe HERE even though it deadlocks on
+    // WriteWaitQueue in WinVhciPurgeBacklogs. These two queues hold BTHX
+    // IOCTLs forwarded from BthMini, which belong to a different file object
+    // from the one being closed, so nothing in this close path is waiting on
+    // them. See the comment in WinVhciPurgeBacklogs.
     //
     WdfIoQueuePurgeSynchronously(ctx->ReadEventQueue);
     WdfIoQueuePurgeSynchronously(ctx->ReadDataQueue);
