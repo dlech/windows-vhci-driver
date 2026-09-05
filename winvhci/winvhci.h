@@ -106,29 +106,49 @@ Environment:
 #define WINVHCI_MAX_H4_PACKET (1 + WINVHCI_MAX_BODY)
 
 //
-// Backlog policy. The two directions are NOT symmetric, because the producer
-// differs and only one of them can be told to wait.
+// Backlog policy, deliberately the same as Linux's /dev/vhci: UNBOUNDED ONCE
+// ADMITTED, REJECTED UP FRONT WHEN INADMISSIBLE. This driver's control
+// protocol was modelled on that one, so its flow control should not be a
+// surprise to a client written against it.
 //
-// userspace -> stack: BACKPRESSURE. The producer is a userspace simulator
-//   holding \\.\WinVhci, so its WRITE can be pended until the stack drains a
-//   slot. That is honest - the writer learns the controller is behind - and it
-//   is also the only safe answer, because an unbounded queue fed by userspace
-//   is a non-paged pool exhaustion primitive available to anyone who can open
-//   the device. WINVHCI_MAX_BACKLOG is the depth at which writes start waiting.
+// Both directions are unbounded lists, never dropping while there is somewhere
+// to deliver. That mirrors hci_vhci.c exactly: the controller -> host
+// direction lands in hdev->rx_q via hci_recv_frame and the host -> controller
+// direction in data->readq, and neither has a capacity check, a drop threshold
+// or any blocking - packets accumulate without restriction.
 //
-// stack -> userspace: UNBOUNDED. The producer is BthPort, which cannot be told
-//   to wait: the packets are HCI commands and ACL data it has already handed
-//   off, and discarding one silently breaks bring-up in a way nothing can
-//   recover from or even report. So this direction is never bounded, and never
-//   drops while a client is attached. It drops only when NO client holds the
-//   device, where the alternative is an unbounded list nobody will ever read.
+// The admission checks are what keep that honest, and Linux has two:
 //
-// This replaced a single bound of 64 on both directions, where overflow dropped
-// and counted. The count was unreadable from userspace, so the loss was
-// invisible: a discarded advertising report just looked like a device that
-// would not be discovered.
+//   if (!data->hdev) { kfree_skb(skb); return -ENODEV; }   // vhci_get_user
 //
-#define WINVHCI_MAX_BACKLOG 64
+// and, deeper in, hci_recv_frame refuses with -ENXIO unless HCI_UP or HCI_INIT
+// is set. So a packet is either deliverable and queued without limit, or
+// refused immediately and by name. WinVhciDispatchWrite implements the first
+// of those as STATUS_DEVICE_NOT_READY.
+//
+// TWO REJECTED DESIGNS, both of which this code has actually had:
+//
+//   A bound of 64 with a silent drop on overflow. The count was unreadable
+//   from userspace, so the loss was invisible - a discarded advertising report
+//   just looked like a device that would not be discovered.
+//
+//   A bound of 64 with BACKPRESSURE on overflow, pending the write until the
+//   stack drained a slot. Non-lossy, and it measurably worked, but it answered
+//   the wrong question. The only state that ever reached the bound was "no
+//   radio, so nothing is draining" - a settled stack always has a read pended,
+//   and 30,000 advertising reports at full speed never took the depth above
+//   zero. Pending a write that has nowhere to go is not backpressure, it is a
+//   slower failure; and queueing pre-radio packets meant they were replayed
+//   into the bring-up of a radio that did not exist when they were sent, which
+//   is precisely what -ENODEV exists to make unrepresentable.
+//
+// THE COST, stated plainly: an unbounded queue fed by userspace is a non-paged
+// pool exhaustion primitive for whoever holds the handle. Linux carries the
+// identical exposure on hdev->rx_q, and winvhci.inx restricts the device to
+// SYSTEM and Administrators, so the client is already privileged. If that ever
+// needs bounding, bound it with a hard failure and a counter, not by pending -
+// see above for why.
+//
 
 //
 // Statistics, readable from userspace so a test can assert the driver lost
@@ -151,8 +171,9 @@ typedef struct _WINVHCI_STATS {
     ULONG DropsAllocFailed;     // ExAllocatePool2 returned NULL
 
     //
-    // Current and peak queue depths. The peaks are what say whether
-    // WINVHCI_MAX_BACKLOG is anywhere near being reached in practice.
+    // Current and peak queue depths. Both directions are unbounded, so these
+    // are informational - they say how much a client or the stack actually let
+    // build up, not how close anything came to a limit.
     //
     ULONG HostToCtrlCount;
     ULONG HostToCtrlPeak;
@@ -162,21 +183,21 @@ typedef struct _WINVHCI_STATS {
     ULONG PendingDataPeak;
 
     //
-    // Totals moved in each direction. These are the denominators: without
-    // them a flat WritesPended is ambiguous between "userspace sent nothing"
-    // and "userspace sent plenty and the stack kept up", which is not a
+    // Totals moved in each direction, and the denominators for everything
+    // above. Without them a depth of zero is ambiguous between "nothing was
+    // sent" and "everything was sent and the far side kept up", which is not a
     // distinction a test should have to guess at.
     //
     ULONG WritesTotal;          // H4 packets accepted from userspace
     ULONG QueuedToUserTotal;    // packets queued stack -> userspace
 
     //
-    // How many userspace writes have been pended for backpressure, and how
-    // many are waiting now. A rising total with a healthy stack is normal;
-    // a permanently non-zero Waiting means the stack stopped draining.
+    // Writes refused because no radio existed yet - the
+    // STATUS_DEVICE_NOT_READY path that mirrors Linux's -ENODEV. A client that
+    // asks for its radio before sending anything, as Bumble's vhci transport
+    // does, never increments this.
     //
-    ULONG WritesPended;
-    ULONG WritesWaiting;
+    ULONG WritesNoRadio;
 } WINVHCI_STATS, *PWINVHCI_STATS;
 
 #define WINVHCI_POOL_TAG 'ihvW'
@@ -220,13 +241,6 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     WDFFILEOBJECT Owner;            // the one open handle, or NULL
 
     //
-    // Userspace writes pended for backpressure, waiting for the stack to drain
-    // a slot off PendingEventList or PendingDataList. Manual dispatch: nothing
-    // completes these but WinVhciDrainWriteWaiters.
-    //
-    WDFQUEUE      WriteWaitQueue;
-
-    //
     // Backlogs, for whichever side of a rendezvous arrives first.
     //
     LIST_ENTRY  HostToCtrlList;     // stack -> userspace, UNBOUNDED
@@ -238,8 +252,8 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     ULONG       PendingDataCount;
 
     //
-    // Peaks, so a test can see how close the bounded direction came to
-    // blocking rather than only whether it did.
+    // Peaks, so a test can see how much actually built up. Neither direction
+    // is bounded, so these are diagnostics rather than headroom.
     //
     ULONG       HostToCtrlPeak;
     ULONG       PendingEventPeak;
@@ -248,8 +262,8 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     //
     // Losses, split by cause because they mean completely different things: a
     // client that vanished mid-flight is expected, a failed allocation is not.
-    // Neither should ever be non-zero because a queue was full - that is what
-    // backpressure and the unbounded direction exist to prevent.
+    // Neither can ever be non-zero because a queue was full - nothing here is
+    // bounded.
     //
     ULONG       DropsNoClient;
     ULONG       DropsAllocFailed;
@@ -259,9 +273,7 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     //
     ULONG       WritesTotal;        // H4 packets accepted from userspace
     ULONG       QueuedToUserTotal;  // packets queued stack -> userspace
-
-    ULONG       WritesPended;       // cumulative
-    ULONG       WritesWaiting;      // currently on WriteWaitQueue
+    ULONG       WritesNoRadio;      // refused, no radio existed yet
 
     BOOLEAN     RadioPresent;
     ULONG       NextRadioId;
@@ -397,16 +409,6 @@ WinVhciQueueToUser(
 
 VOID
 WinVhciPurgeBacklogs(
-    _In_ PWINVHCI_FDO_CONTEXT Ctx
-    );
-
-//
-// Release one userspace write that was pended for backpressure. Called after a
-// slot is freed on the bounded userspace -> stack direction, with the FDO lock
-// NOT held.
-//
-VOID
-WinVhciDrainWriteWaiters(
     _In_ PWINVHCI_FDO_CONTEXT Ctx
     );
 

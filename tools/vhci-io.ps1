@@ -24,9 +24,9 @@ public static class VhciIo {
     const uint WAIT_OBJECT_0        = 0;
     const uint WAIT_TIMEOUT         = 258;
 
-    // How long a write may pend before it is treated as a stalled stack rather
-    // than as backpressure. Generous: the driver releases a pended write as
-    // soon as the stack takes one packet, so reaching this is a fault.
+    // Bound on a write. The driver never pends a write - its backlogs are
+    // unbounded and every path either completes or fails - so reaching this is
+    // always a fault rather than congestion.
     const uint WRITE_TIMEOUT_MS     = 5000;
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -141,13 +141,8 @@ public static class VhciIo {
                 // The timeout has to be acted on. This used to ignore the
                 // wait result and fall straight into GetOverlappedResult with
                 // bWait = true, which waits FOREVER - so the 5 s bound was
-                // decorative and a stalled write hung the caller outright.
-                //
-                // That was harmless only while the driver failed a write the
-                // instant its backlog was full. The driver now pends the write
-                // for backpressure instead, so a write legitimately blocks
-                // until the Bluetooth stack drains one packet, and "the stack
-                // stopped draining" has to be reported rather than waited on.
+                // decorative and a wedged device hung the caller outright with
+                // no way to tell it from a slow one.
                 if (WaitForSingleObject(evt, WRITE_TIMEOUT_MS) == WAIT_TIMEOUT) {
                     CancelIoEx(_handle, ov);
                     // Collect the cancelled request so the OVERLAPPED is not
@@ -155,9 +150,9 @@ public static class VhciIo {
                     GetOverlappedResult(_handle, ov, out n, true);
                     throw new TimeoutException(
                         "write did not complete within " + WRITE_TIMEOUT_MS +
-                        " ms. The driver pends a write when its backlog to the " +
-                        "Bluetooth stack is full, so this means the stack " +
-                        "stopped draining - check IOCTL_WINVHCI_GET_STATS.");
+                        " ms. The driver completes or fails every write, so " +
+                        "this means the device is wedged - check " +
+                        "IOCTL_WINVHCI_GET_STATS.");
                 }
             }
             if (!GetOverlappedResult(_handle, ov, out n, true)) {
@@ -167,88 +162,6 @@ public static class VhciIo {
             Marshal.FreeHGlobal(ov);
             CloseHandle(evt);
         }
-    }
-
-    // --- writes that are allowed to still be in flight --------------------
-    //
-    // Write() above waits for completion, which cannot express the one case
-    // worth testing: a write that the driver has PENDED for backpressure and
-    // will complete later. Waiting for it is precisely what must not happen -
-    // the caller has to be able to issue more writes, and then do the thing
-    // that releases them.
-    //
-    // So these split the operation. BeginWrite issues it and returns a token;
-    // EndWrite collects the result. The buffer is pinned for the duration,
-    // because the driver may copy from it after BeginWrite has returned.
-
-    public class PendingWrite {
-        public IntPtr Event;
-        public IntPtr Overlapped;
-        public GCHandle Pin;
-        public int Length;
-        public bool Completed;
-    }
-
-    public static PendingWrite BeginWrite(byte[] buf, int len) {
-        PendingWrite w = new PendingWrite();
-        w.Event      = CreateEventW(IntPtr.Zero, true, false, null);
-        w.Overlapped = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(NativeOverlapped)));
-        w.Pin        = GCHandle.Alloc(buf, GCHandleType.Pinned);
-        w.Length     = len;
-
-        NativeOverlapped o = new NativeOverlapped();
-        o.EventHandle = w.Event;
-        Marshal.StructureToPtr(o, w.Overlapped, false);
-
-        if (!WriteFile(_handle, buf, len, IntPtr.Zero, w.Overlapped)) {
-            int err = Marshal.GetLastWin32Error();
-            if (err != ERROR_IO_PENDING) {
-                FreeWrite(w);
-                throw new Win32Exception(err, "WriteFile failed");
-            }
-        } else {
-            w.Completed = true;
-        }
-        return w;
-    }
-
-    // True if the write completed within the timeout. Throws if it failed for
-    // any reason other than not having finished yet.
-    public static bool EndWrite(PendingWrite w, int timeoutMs) {
-        try {
-            if (!w.Completed) {
-                if (WaitForSingleObject(w.Event, (uint)timeoutMs) != WAIT_OBJECT_0) {
-                    return false;
-                }
-            }
-            int n;
-            if (!GetOverlappedResult(_handle, w.Overlapped, out n, true)) {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "write failed");
-            }
-            if (n != w.Length) {
-                throw new InvalidOperationException(
-                    "short write: " + n + " of " + w.Length + " bytes");
-            }
-            return true;
-        } finally {
-            FreeWrite(w);
-        }
-    }
-
-    // Abandon a write that is still pending. Cancels it and reaps the result,
-    // so the OVERLAPPED and the pinned buffer are not released while the
-    // driver may still be using them.
-    public static void CancelWrite(PendingWrite w) {
-        int n;
-        CancelIoEx(_handle, w.Overlapped);
-        GetOverlappedResult(_handle, w.Overlapped, out n, true);
-        FreeWrite(w);
-    }
-
-    static void FreeWrite(PendingWrite w) {
-        if (w.Pin.IsAllocated) { w.Pin.Free(); }
-        if (w.Overlapped != IntPtr.Zero) { Marshal.FreeHGlobal(w.Overlapped); w.Overlapped = IntPtr.Zero; }
-        if (w.Event != IntPtr.Zero) { CloseHandle(w.Event); w.Event = IntPtr.Zero; }
     }
 
     // IOCTL_WINVHCI_GET_STATS, from winvhci/winvhci.h:
@@ -282,8 +195,7 @@ public static class VhciIo {
         public uint PendingDataPeak;
         public uint WritesTotal;
         public uint QueuedToUserTotal;
-        public uint WritesPended;
-        public uint WritesWaiting;
+        public uint WritesNoRadio;
     }
 
     public static Stats GetStats() {
@@ -337,7 +249,7 @@ function Format-VhciStats {
     "$Prefix drops        no-client $($s.DropsNoClient)  alloc-failed $($s.DropsAllocFailed)"
     "$Prefix stack->user  depth $($s.HostToCtrlCount)  peak $($s.HostToCtrlPeak)   (unbounded by design)"
     "$Prefix user->stack  events depth $($s.PendingEventCount) peak $($s.PendingEventPeak)   acl depth $($s.PendingDataCount) peak $($s.PendingDataPeak)"
-    "$Prefix writes       pended $($s.WritesPended)  waiting now $($s.WritesWaiting)"
+    "$Prefix refused      no-radio $($s.WritesNoRadio)"
 }
 
 # H4 packet type bytes.

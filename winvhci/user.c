@@ -86,48 +86,13 @@ WinVhciPurgeBacklogs(
     )
 {
     //
-    // Pended writes first, and OUTSIDE the lock, by draining the queue by hand
-    // rather than purging it.
-    //
-    // WdfIoQueuePurgeSynchronously was the obvious choice and it DEADLOCKS on
-    // THIS queue. The rule is about which file object owns the requests, not
-    // about EvtFileClose as such:
-    //
-    //   WriteWaitQueue holds writes belonging to the file object being closed.
-    //   The framework's cleanup for that file object is already waiting for
-    //   those requests to complete, so purging synchronously waits on
-    //   something that cannot finish until this callback returns.
-    //
-    //   ReadEventQueue and ReadDataQueue are purged synchronously from
-    //   EvtFileClose too (see WinVhciEvtFileClose) and do NOT hang, because
-    //   they hold BTHX IOCTLs forwarded from BthMini - kernel-mode requests on
-    //   a different file object, which nothing in this close path is waiting
-    //   for. Do not "fix" those two calls to match this one.
-    //
-    // The symptom is not a hang anyone would attribute to a queue: the close
-    // never finishes, so Owner stays set and the radio stays alive, and the
-    // next CreateFile on an exclusive device fails with ERROR_ACCESS_DENIED -
-    // which reads as a permissions problem, not as a driver that never let go.
-    //
-    // Retrieve-and-complete has none of those constraints, needs no
-    // WdfIoQueueStart afterwards because the queue is never stopped, and is
-    // less machinery for the same effect.
-    //
-    // Draining is not optional. A request the framework still owns when the
-    // device goes away is what BugCheck 0xC4
+    // Freeing the lists is not optional. A packet still on one of these when
+    // the device goes away is what BugCheck 0xC4
     // (DRIVER_VERIFIER_DETECTED_VIOLATION) is for, and this driver has already
     // been bitten once by that shape of bug - packets queued for a client that
     // had gone, surviving until unload.
     //
-    if (Ctx->WriteWaitQueue != NULL) {
-        WDFREQUEST request;
-        while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Ctx->WriteWaitQueue, &request))) {
-            WdfRequestCompleteWithInformation(request, STATUS_CANCELLED, 0);
-        }
-    }
-
     WdfSpinLockAcquire(Ctx->Lock);
-    Ctx->WritesWaiting = 0;
     WinVhciFreeList(&Ctx->HostToCtrlList,   &Ctx->HostToCtrlCount);
     WinVhciFreeList(&Ctx->PendingEventList, &Ctx->PendingEventCount);
     WinVhciFreeList(&Ctx->PendingDataList,  &Ctx->PendingDataCount);
@@ -343,18 +308,6 @@ WinVhciTakePendingForStack(
     }
     WdfSpinLockRelease(Ctx->Lock);
 
-    //
-    // A slot just came free, so one write pended for backpressure can proceed.
-    // This is the ONLY place the bounded direction shrinks, which is why it is
-    // the only place that needs to release a waiter.
-    //
-    // Deliberately after the lock is released: re-dispatching the write
-    // acquires it again.
-    //
-    if (p != NULL) {
-        WinVhciDrainWriteWaiters(Ctx);
-    }
-
     return p;
 }
 
@@ -476,6 +429,40 @@ Routine Description:
 
     case WINVHCI_H4_EVENT:
     case WINVHCI_H4_ACL:
+        //
+        // ADMISSION CHECK, and the reason the backlogs below can be unbounded.
+        // This is Linux's, from vhci_get_user:
+        //
+        //     case HCI_EVENT_PKT:
+        //     case HCI_ACLDATA_PKT:
+        //     case HCI_SCODATA_PKT:
+        //     case HCI_ISODATA_PKT:
+        //             if (!data->hdev) {
+        //                     kfree_skb(skb);
+        //                     return -ENODEV;
+        //             }
+        //
+        // Without it, a client that writes before asking for its radio gets
+        // its packets queued against a stack that does not exist, and they are
+        // then replayed into the bring-up of a radio that had not been created
+        // when they were sent. That was measured, not imagined: 200 pre-radio
+        // advertising reports were all delivered the instant the radio
+        // appeared.
+        //
+        // Checked without the lock. RadioPresent only ever goes FALSE from
+        // EvtFileClose, which cannot run concurrently with a write on the same
+        // handle, so a torn read is not reachable from here.
+        //
+        if (!ctx->RadioPresent) {
+            WdfSpinLockAcquire(ctx->Lock);
+            ctx->WritesNoRadio++;
+            WdfSpinLockRelease(ctx->Lock);
+            KdPrint(("winvhci: type 0x%02x written before a radio was requested\n",
+                     type));
+            status = STATUS_DEVICE_NOT_READY;
+            break;
+        }
+
         status = WinVhciDeliverToStack(ctx, type, buffer + 1, (ULONG)bufferLength - 1);
         break;
 
@@ -505,34 +492,8 @@ Routine Description:
     }
 
     //
-    // Backpressure: the stack's backlog is full, so this write waits on
-    // WriteWaitQueue instead of failing. WinVhciDrainWriteWaiters releases it
-    // when the stack takes a packet off the list.
-    //
-    // Nothing is lost and nothing is completed here - the request stays alive,
-    // owned by the queue, and the client's WriteFile simply has not returned
-    // yet. An overlapped client sees ERROR_IO_PENDING, which it already
-    // handles for every write.
-    //
-    if (status == STATUS_PENDING) {
-        NTSTATUS forwarded = WdfRequestForwardToIoQueue(Request, ctx->WriteWaitQueue);
-        if (!NT_SUCCESS(forwarded)) {
-            //
-            // Only happens if the queue is being purged, i.e. the device or
-            // the handle is going away. Complete it rather than leak it.
-            //
-            KdPrint(("winvhci: cannot pend write (%!STATUS!), completing\n", forwarded));
-            WdfRequestCompleteWithInformation(Request, forwarded, 0);
-            return;
-        }
-
-        WdfSpinLockAcquire(ctx->Lock);
-        ctx->WritesPended++;
-        ctx->WritesWaiting++;
-        WdfSpinLockRelease(ctx->Lock);
-        return;
-    }
-
+    // Every path above either succeeded or failed outright. A write is never
+    // pended: the backlogs are unbounded, so there is nothing to wait for.
     //
     // Report the whole transfer as consumed on success, so a client's write
     // loop does not have to reason about the type byte.
@@ -540,42 +501,6 @@ Routine Description:
     WdfRequestCompleteWithInformation(Request,
                                       status,
                                       NT_SUCCESS(status) ? Length : 0);
-}
-
-VOID
-WinVhciDrainWriteWaiters(
-    _In_ PWINVHCI_FDO_CONTEXT Ctx
-    )
-/*++
-
-Routine Description:
-
-    Release ONE write that was pended for backpressure, because one slot has
-    just been freed. Exactly one, so a freed slot cannot release a waiter that
-    then has nowhere to go - and if the released write finds the backlog full
-    again it simply pends again, which is correct rather than a spin.
-
-    Called with the lock NOT held: re-dispatching acquires it.
-
---*/
-{
-    WDFREQUEST request;
-
-    if (Ctx->WriteWaitQueue == NULL) {
-        return;
-    }
-
-    if (!NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Ctx->WriteWaitQueue, &request))) {
-        return;
-    }
-
-    WdfSpinLockAcquire(Ctx->Lock);
-    if (Ctx->WritesWaiting > 0) {
-        Ctx->WritesWaiting--;
-    }
-    WdfSpinLockRelease(Ctx->Lock);
-
-    WinVhciDispatchWrite(Ctx, request);
 }
 
 VOID
@@ -661,8 +586,7 @@ Routine Description:
     out->PendingDataPeak   = ctx->PendingDataPeak;
     out->WritesTotal       = ctx->WritesTotal;
     out->QueuedToUserTotal = ctx->QueuedToUserTotal;
-    out->WritesPended      = ctx->WritesPended;
-    out->WritesWaiting     = ctx->WritesWaiting;
+    out->WritesNoRadio     = ctx->WritesNoRadio;
     WdfSpinLockRelease(ctx->Lock);
 
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(WINVHCI_STATS));
@@ -729,11 +653,21 @@ Routine Description:
     // Outstanding BTHX reads must not survive the client that was supposed to
     // answer them.
     //
-    // Purging synchronously is safe HERE even though it deadlocks on
-    // WriteWaitQueue in WinVhciPurgeBacklogs. These two queues hold BTHX
-    // IOCTLs forwarded from BthMini, which belong to a different file object
-    // from the one being closed, so nothing in this close path is waiting on
-    // them. See the comment in WinVhciPurgeBacklogs.
+    // Purging SYNCHRONOUSLY is safe here, which is worth stating because the
+    // general rule says otherwise. Purging a queue synchronously from
+    // EvtFileClose deadlocks when the queue holds requests owned by the file
+    // object being closed: the framework's cleanup for that file object is
+    // already waiting for them, so the purge waits on something that cannot
+    // finish until this callback returns. These two queues hold BTHX IOCTLs
+    // forwarded from BthMini - kernel-mode requests on a different file
+    // object, which nothing in this close path waits for - so they drain and
+    // return.
+    //
+    // Learned by doing it wrong on a queue of userspace writes, where the
+    // symptom looked nothing like a queue problem: the close never finished,
+    // so Owner stayed set and the radio stayed alive, and the next CreateFile
+    // on an exclusive device failed with ERROR_ACCESS_DENIED - which reads as
+    // a permissions problem, not as a driver that never let go.
     //
     WdfIoQueuePurgeSynchronously(ctx->ReadEventQueue);
     WdfIoQueuePurgeSynchronously(ctx->ReadDataQueue);
@@ -813,19 +747,6 @@ WinVhciUserCreateQueues(
     status = WdfIoQueueCreate(Device, &config, WDF_NO_OBJECT_ATTRIBUTES, &ctx->UserReadQueue);
     if (!NT_SUCCESS(status)) {
         KdPrint(("winvhci: UserReadQueue create failed 0x%08x\n", status));
-        return status;
-    }
-
-    //
-    // Writes pended for backpressure. Manual, because nothing dispatches these
-    // except WinVhciDrainWriteWaiters when the stack frees a slot.
-    //
-    WDF_IO_QUEUE_CONFIG_INIT(&config, WdfIoQueueDispatchManual);
-    config.PowerManaged = WdfFalse;
-
-    status = WdfIoQueueCreate(Device, &config, WDF_NO_OBJECT_ATTRIBUTES, &ctx->WriteWaitQueue);
-    if (!NT_SUCCESS(status)) {
-        KdPrint(("winvhci: WriteWaitQueue create failed 0x%08x\n", status));
         return status;
     }
 
