@@ -97,7 +97,7 @@ jobs:
             -WdkVersion $env:WDK_VERSION `
             -OutDir out
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: winvhci-${{ matrix.platform }}-${{ matrix.configuration }}
           path: out/
@@ -106,7 +106,7 @@ jobs:
       # The binlog is the only practical way to see which of the WDK's
       # Exists()-guarded imports actually resolved, which is the failure mode
       # most likely to bite when the toolchain moves.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: buildlog-${{ matrix.platform }}-${{ matrix.configuration }}
@@ -131,12 +131,18 @@ jobs:
 
       # Debug, not Release: KdPrint is #if DBG, so a Release load failure would
       # be silent just when the output is most needed.
-      - uses: actions/download-artifact@v4
+      #
+      # Pinned to v7 rather than the current v8 deliberately. v8 stops
+      # unconditionally unzipping downloads - it inspects Content-Type instead,
+      # to support direct uploads - and this job depends on the artifact
+      # arriving as an unpacked tree at pkg\package\. v7 is already on Node 24,
+      # so it clears the deprecation without taking that change on.
+      - uses: actions/download-artifact@v7
         with:
           name: winvhci-${{ matrix.platform }}-Debug
           path: pkg
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         id: py
         with:
           python-version: '3.12'
@@ -181,7 +187,7 @@ jobs:
           # which is what identifies the missing handler.
           Copy-Item bumble.*.log diag\ -ErrorAction SilentlyContinue
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: smoke-diag-${{ matrix.platform }}
