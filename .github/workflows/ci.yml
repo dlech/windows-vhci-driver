@@ -22,7 +22,10 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    # ci/** so that work on the pipeline itself can be iterated on directly.
+    # workflow_dispatch is not an alternative: GitHub only offers it for
+    # workflows that already exist on the default branch.
+    branches: [master, 'ci/**']
   pull_request:
   workflow_dispatch:
 
