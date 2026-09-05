@@ -233,6 +233,54 @@ try {
     Assert 'no further write was refused' `
            ($after.WritesNoRadio -eq $refused.WritesNoRadio) `
            "WritesNoRadio rose to $($after.WritesNoRadio) after the radio existed"
+
+    # ---------------------------------------------------------------------
+    # And once the STACK gives up, not just before the radio exists.
+    #
+    # There is no controller behind this radio, so BthPort sends HCI_Reset,
+    # retries once, and abandons it about twelve seconds in - measured:
+    #
+    #     4.047549   command opcode 0x0c03   <-- HCI_Reset
+    #     8.055532   command opcode 0x0c03   <-- HCI_Reset, retry
+    #    12.055968   pdo D0 exit (target 5); the stack has stopped consuming
+    #
+    # RadioPresent is still TRUE at that point - the client has not withdrawn
+    # anything - so without the D0Exit hook these writes were all admitted and
+    # queued against nothing, 300 deep and unbounded when last measured. This
+    # is Linux's second gate, hci_recv_frame refusing with -ENXIO unless HCI_UP
+    # or HCI_INIT is set.
+    #
+    # It doubles as the thing that makes the phases above honest: everything
+    # before here has to finish inside that twelve-second window, so if this
+    # assertion ever starts failing the first suspect is that the earlier
+    # phases got slow enough to straddle it.
+    Write-Host ''
+    Write-Host 'once the stack gives up on the radio:' -ForegroundColor Cyan
+    $gaveUp = $false
+    $by = (Get-Date).AddSeconds($SettleSec * 2)
+    while ((Get-Date) -lt $by) {
+        Start-Sleep -Seconds 2
+        $r = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+            Where-Object { $_.InstanceId -like 'WINVHCI\RADIO*' -and $_.Problem -ne 'CM_PROB_PHANTOM' }
+        if ($r -and $r.Status -eq 'Error') { $gaveUp = $true; break }
+    }
+    Assert 'the radio fails without a controller answering it' $gaveUp `
+           'it never reached Status=Error, so the rest of this phase proves nothing'
+
+    if ($gaveUp) {
+        $downBefore = [VhciIo]::GetStats()
+        $downErr = Try-Write $adv
+        $down = [VhciIo]::GetStats()
+
+        Assert 'a write into the failed radio is refused' ($downErr -eq $ERROR_NOT_READY) `
+               "got $downErr, expected $ERROR_NOT_READY - it was admitted and queued against nothing"
+        Assert 'that refusal was counted' `
+               ($down.WritesNoRadio - $downBefore.WritesNoRadio -eq 1) `
+               "WritesNoRadio moved by $($down.WritesNoRadio - $downBefore.WritesNoRadio)"
+        Assert 'the stale backlog was dropped when the stack went down' `
+               ($down.PendingEventCount -eq 0 -and $down.PendingDataCount -eq 0) `
+               "event depth $($down.PendingEventCount), acl depth $($down.PendingDataCount) - these would be replayed into the next radio"
+    }
 }
 finally {
     [VhciIo]::Close()

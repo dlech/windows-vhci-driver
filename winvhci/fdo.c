@@ -749,6 +749,13 @@ Routine Description:
         return status;
     }
 
+    //
+    // Cancellation is left to the framework. BthPort does cancel these when it
+    // gives up on a radio - measured - but the driver learns the same thing
+    // from the PDO's EvtDeviceD0Exit half a millisecond later, and registering
+    // EvtIoCanceledOnQueue would take ownership of every cancelled request for
+    // no gain.
+    //
     WDF_IO_QUEUE_CONFIG_INIT(&config, WdfIoQueueDispatchManual);
     config.PowerManaged = WdfFalse;
 

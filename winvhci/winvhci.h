@@ -276,6 +276,25 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     ULONG       WritesNoRadio;      // refused, no radio existed yet
 
     BOOLEAN     RadioPresent;
+
+    //
+    // TRUE while the radio PDO is started and in D0, i.e. while the Bluetooth
+    // stack above it is actually consuming. This is winvhci's HCI_UP: Linux
+    // refuses a packet with -ENXIO unless HCI_UP or HCI_INIT is set, and
+    // without an equivalent a client can keep writing into a radio whose stack
+    // gave up, with nothing draining and nothing to say so.
+    //
+    // Set from the PDO's EvtDeviceD0Entry, cleared from its EvtDeviceD0Exit.
+    // Measured: when BthPort's initialisation times out it cancels every
+    // parked READ_HCI and the PDO is surprise-removed and dropped to D3, all
+    // of it about two seconds before a client's next write arrives.
+    //
+    // Distinct from RadioPresent, which tracks whether the CLIENT has asked
+    // for a radio. Both must hold for a write to be admitted: RadioPresent
+    // alone is true through a failed bring-up, and this alone would be false
+    // during an ordinary system sleep, when the client has done nothing wrong.
+    //
+    BOOLEAN     RadioStarted;
     ULONG       NextRadioId;
 
     WDFSPINLOCK Lock;               // guards every field above and below
@@ -409,6 +428,15 @@ WinVhciQueueToUser(
 
 VOID
 WinVhciPurgeBacklogs(
+    _In_ PWINVHCI_FDO_CONTEXT Ctx
+    );
+
+//
+// The radio's stack has stopped consuming: clear RadioStarted and drop the
+// userspace -> stack backlogs. Called from the PDO's EvtDeviceD0Exit.
+//
+VOID
+WinVhciRadioStackDown(
     _In_ PWINVHCI_FDO_CONTEXT Ctx
     );
 
