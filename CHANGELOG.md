@@ -12,6 +12,21 @@ the supported runner images.
 
 ## [Unreleased]
 
+### Added
+
+- `VhciStats.radios_alive` reports how many radio device nodes still exist.
+  It stays non-zero until Windows finishes removing one, which can take much
+  longer than closing the handle, so a client creating radios back to back can
+  wait for it rather than guess.
+- `winvhci.transport` honors `BUMBLE_SNOOPER`, as Bumble's own transports do,
+  so HCI traffic can be captured to a btsnoop file.
+
+### Fixed
+
+- The radio no longer leaves a permanent devnode behind each time it is
+  created. Windows now reuses one, so repeated use does not accumulate stale
+  entries.
+
 ## [1.1.1] - 2026-09-05
 
 ### Fixed

@@ -117,6 +117,7 @@ class _WINVHCI_STATS(ctypes.Structure):
         ('WritesTotal', wintypes.ULONG),
         ('QueuedToUserTotal', wintypes.ULONG),
         ('WritesNoRadio', wintypes.ULONG),
+        ('RadiosAlive', wintypes.ULONG),
     ]
 
 
@@ -162,6 +163,19 @@ class VhciStats:
     #: this.
     writes_no_radio: int
 
+    #: Radio PDOs that still exist. Not the same as "a client has a radio":
+    #: this counts framework device objects, so it falls to zero only once
+    #: Windows has finished removing the devnode. That can lag the handle
+    #: closing by more than thirty seconds, because a virtual radio disappears
+    #: the instant its client does - which no real radio does - and the
+    #: Bluetooth stack retries it as though it had gone out of range before
+    #: letting go.
+    #:
+    #: Opening the device again while this is non-zero leaves Windows with two
+    #: radios at one address, so a client creating radios back to back should
+    #: wait for it to reach zero.
+    radios_alive: int
+
     @property
     def total_drops(self) -> int:
         return self.drops_no_client + self.drops_alloc_failed
@@ -180,6 +194,7 @@ class VhciStats:
             writes_total=raw.WritesTotal,
             queued_to_user_total=raw.QueuedToUserTotal,
             writes_no_radio=raw.WritesNoRadio,
+            radios_alive=raw.RadiosAlive,
         )
 
 

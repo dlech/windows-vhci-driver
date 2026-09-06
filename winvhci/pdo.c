@@ -133,6 +133,38 @@ Routine Description:
     return STATUS_SUCCESS;
 }
 
+VOID
+WinVhciPdoEvtCleanup(
+    _In_ WDFOBJECT Object
+    )
+/*++
+
+Routine Description:
+
+    The radio PDO is being destroyed. This is the moment the devnode is really
+    gone, as distinct from D0Exit above, which fires when the stack stops
+    consuming, and from EvtFileClose, which fires when the client lets go.
+
+    Those three are seconds to tens of seconds apart, and conflating them is
+    what made the Bluetooth radio appear to linger: PnP reported the devnode OK
+    and WinRT reported RadioState.ON for over thirty seconds after a close,
+    because the stack goes on retrying a radio it believes has gone out of
+    range. Only this callback marks the end of that.
+
+    Not paged: object cleanup can run at DISPATCH_LEVEL, and it must not touch
+    anything pageable. The interlocked decrement is all it does.
+
+--*/
+{
+    PWINVHCI_PDO_CONTEXT pdoCtx = WinVhciPdoGetContext((WDFDEVICE)Object);
+    LONG                 left;
+
+    left = InterlockedDecrement(&WinVhciFdoGetContext(pdoCtx->Fdo)->RadiosAlive);
+
+    KdPrint(("winvhci: pdo destroyed, radio %u; %d still alive\n",
+             pdoCtx->RadioId, left));
+}
+
 static VOID
 WinVhciPdoForwardToParent(
     _In_ WDFQUEUE   Queue,
@@ -240,7 +272,11 @@ WinVhciEvtChildListCreateDevice(
     DECLARE_CONST_UNICODE_STRING(deviceText,   L"Virtual Bluetooth Radio");
     DECLARE_CONST_UNICODE_STRING(deviceLocale, L"winvhci");
 
-    DECLARE_UNICODE_STRING_SIZE(instanceId, 16);
+    //
+    // A CONSTANT instance ID, deliberately - see WinVhciEvtChildListCreateDevice
+    // below for why it is not the radio id.
+    //
+    DECLARE_CONST_UNICODE_STRING(instanceId, L"0");
 
     PAGED_CODE();
 
@@ -259,9 +295,28 @@ WinVhciEvtChildListCreateDevice(
     status = WdfPdoInitAddCompatibleID(ChildInit, &compatibleId);
     if (!NT_SUCCESS(status)) { goto Fail; }
 
-    status = RtlUnicodeStringPrintf(&instanceId, L"%u", id->RadioId);
-    if (!NT_SUCCESS(status)) { goto Fail; }
-
+    //
+    // The instance ID is a constant, NOT the radio id, because Windows creates
+    // one permanent devnode per distinct instance ID and never reclaims it.
+    // Using the radio id left a registry entry behind for every radio ever
+    // created - measured at 1428 on the test guest, and they take about fifteen
+    // minutes to purge with pnputil. The driver cannot clean them up itself:
+    // marking a child missing (WinVhciRemoveRadios) removes the device from the
+    // active tree, but the Enum key persisting is deliberate Windows behavior
+    // for every device, and deleting it is a user-mode, elevated operation. So
+    // the accumulation has to be prevented here rather than cleaned up later.
+    //
+    // Reusing an ID reuses the devnode, which is measured, not assumed: opening
+    // a radio whose instance ID already existed left the devnode count
+    // unchanged.
+    //
+    // A constant cannot collide. DEVICE_CAPABILITIES.UniqueID is FALSE (nothing
+    // sets it), so PnP itself makes the device instance ID unique - it is what
+    // turns our "0" into WINVHCI\RADIO\1&79f5d87&1a&0. A real adapter is out of
+    // reach regardless, being in the USB, PCI or BTHENUM namespace rather than
+    // ours. And only one radio exists at a time in any case: the control device
+    // is exclusive.
+    //
     status = WdfPdoInitAssignInstanceID(ChildInit, &instanceId);
     if (!NT_SUCCESS(status)) { goto Fail; }
 
@@ -285,12 +340,27 @@ WinVhciEvtChildListCreateDevice(
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, WINVHCI_PDO_CONTEXT);
 
+    //
+    // Runs when the framework destroys this object, which is after PnP has
+    // finished removing the devnode - NOT when the client closed its handle.
+    // That gap is the whole point: it is where the Bluetooth stack is still
+    // retrying a radio it thinks went out of range, and it has been measured at
+    // over thirty seconds.
+    //
+    attributes.EvtCleanupCallback = WinVhciPdoEvtCleanup;
+
     status = WdfDeviceCreate(&ChildInit, &attributes, &pdo);
     if (!NT_SUCCESS(status)) { goto Fail; }
 
     pdoCtx = WinVhciPdoGetContext(pdo);
     pdoCtx->Fdo     = WdfChildListGetDevice(ChildList);
     pdoCtx->RadioId = id->RadioId;
+
+    //
+    // Counted only once the object exists, so the cleanup callback that
+    // decrements is guaranteed to have been registered on something real.
+    //
+    InterlockedIncrement(&WinVhciFdoGetContext(pdoCtx->Fdo)->RadiosAlive);
 
     WDF_DEVICE_PNP_CAPABILITIES_INIT(&pnpCaps);
     pnpCaps.Removable         = WdfTrue;

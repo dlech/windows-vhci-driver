@@ -198,6 +198,21 @@ typedef struct _WINVHCI_STATS {
     // does, never increments this.
     //
     ULONG WritesNoRadio;
+
+    //
+    // Radio PDOs that still exist. This is NOT "has a client asked for a
+    // radio" - that is RadioPresent, which the close path clears at once. This
+    // counts framework device objects, so it drops to zero only when PnP has
+    // finished removing the devnode, which can lag the handle closing by half
+    // a minute: a virtual radio vanishes the moment its client goes away,
+    // which no real radio does, and the Bluetooth stack retries it as though
+    // it had merely gone out of range before letting go.
+    //
+    // A client that creates radios back to back needs this, because opening
+    // the device again while the previous radio is still being removed leaves
+    // Windows with two radios at one address.
+    //
+    ULONG RadiosAlive;
 } WINVHCI_STATS, *PWINVHCI_STATS;
 
 #define WINVHCI_POOL_TAG 'ihvW'
@@ -274,6 +289,16 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     ULONG       WritesTotal;        // H4 packets accepted from userspace
     ULONG       QueuedToUserTotal;  // packets queued stack -> userspace
     ULONG       WritesNoRadio;      // refused, no radio existed yet
+
+    //
+    // Live radio PDOs, as a count of framework device objects rather than of
+    // intent. Incremented when a PDO is created and decremented from its
+    // cleanup callback, which WDF runs when the object is destroyed - that is,
+    // after PnP has finished removing the devnode, not when the client let go
+    // of it. Interlocked rather than under Lock because the cleanup callback
+    // runs on a PnP thread with no relationship to the paths that read it.
+    //
+    volatile LONG RadiosAlive;
 
     BOOLEAN     RadioPresent;
 
@@ -450,6 +475,7 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL WinVhciEvtIoDeviceControl;
 // pdo.c
 //
 EVT_WDF_CHILD_LIST_CREATE_DEVICE WinVhciEvtChildListCreateDevice;
+EVT_WDF_OBJECT_CONTEXT_CLEANUP   WinVhciPdoEvtCleanup;
 
 NTSTATUS
 WinVhciAddRadio(

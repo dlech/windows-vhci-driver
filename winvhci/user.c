@@ -686,6 +686,13 @@ Routine Description:
     out->WritesNoRadio     = ctx->WritesNoRadio;
     WdfSpinLockRelease(ctx->Lock);
 
+    //
+    // Outside the lock deliberately: RadiosAlive is maintained with interlocked
+    // operations from a PnP thread that never takes Lock, so taking it here
+    // would suggest a mutual exclusion that does not exist.
+    //
+    out->RadiosAlive = (ULONG)InterlockedCompareExchange(&ctx->RadiosAlive, 0, 0);
+
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(WINVHCI_STATS));
 }
 
