@@ -29,11 +29,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
+from bumble.snoop import create_snooper
 from bumble.transport.common import (
     PumpedPacketSink,
     PumpedPacketSource,
     PumpedTransport,
+    SnoopingTransport,
     Transport,
 )
 
@@ -120,7 +123,50 @@ async def open_winvhci_transport(spec: str | None = None) -> Transport:
     transport.start()
     sink.on_packet(bytes([HCI_VENDOR_PKT, HCI_BREDR]))
 
-    return transport
+    return _with_snooper(transport, device)
+
+
+def _with_snooper(transport: _WinVhciTransport, device: VhciDevice) -> Transport:
+    r"""Honor ``BUMBLE_SNOOPER``, as every other Bumble transport does.
+
+    Bumble applies this in ``bumble.transport.open_transport``, which this
+    module deliberately does not go through, so without this a winvhci
+    transport would be the one transport you cannot capture. That is exactly
+    backwards: its traffic is the hardest of any to observe by other means,
+    because it never reaches a real radio and so no sniffer can see it.
+
+        BUMBLE_SNOOPER=btsnoop:file:C:\capture.log
+
+    The resulting file opens in Wireshark. That is worth knowing, because an
+    HCI capture answers questions about which side stopped talking first that
+    no amount of Python logging will.
+
+    (Raw docstring: it contains a Windows path, and without the r prefix the
+    backslash in ``C:\capture.log`` is an invalid escape sequence.)
+
+    The radio request written just above is deliberately outside this. It is
+    winvhci's own vendor control packet rather than HCI, and feeding it to a
+    btsnoop reader would only produce a malformed first frame.
+    """
+    spec = os.getenv('BUMBLE_SNOOPER')
+    if not spec:
+        return transport
+
+    try:
+        snooping = SnoopingTransport.create_with(transport, create_snooper(spec))
+    except Exception:
+        # Never let a capture problem stop the transport working - a bad path
+        # in the spec should cost the capture, not the session.
+        logger.exception('could not create the snooper; continuing without one')
+        return transport
+
+    # The wrapper is a plain Transport, so re-expose the device handle, which
+    # is how a caller reads the driver's counters. radio_id is NOT copied: it
+    # is assigned later, when the driver answers the control packet, so a copy
+    # taken now would be permanently None. Read it from `.transport` instead.
+    snooping.device = device  # type: ignore[attr-defined]
+    logger.info('snooping HCI traffic via %s', spec)
+    return snooping
 
 
 def install_transport_scheme() -> None:
