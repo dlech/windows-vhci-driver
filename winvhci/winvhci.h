@@ -189,7 +189,19 @@ typedef struct _WINVHCI_STATS {
     // distinction a test should have to guess at.
     //
     ULONG WritesTotal;          // H4 packets accepted from userspace
-    ULONG QueuedToUserTotal;    // packets queued stack -> userspace
+
+    //
+    // Packets that went onto the stack -> userspace backlog because no read was
+    // pending. This is NOT the total sent to the client, and the name has
+    // misled a reader of these counters before: the common case is a reader
+    // already waiting, which takes the packet directly and never touches this
+    // counter. A settled Bluetooth stack keeps a read pended, so on a healthy
+    // link this stays near zero while thousands of packets flow. Read it as
+    // "how often the client was not there to take a packet immediately"; there
+    // is deliberately no delivered-packet total, so there is no denominator to
+    // compare it against.
+    //
+    ULONG QueuedToUserTotal;
 
     //
     // Writes refused because no radio existed yet - the
