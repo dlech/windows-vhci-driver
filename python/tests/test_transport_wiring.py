@@ -131,3 +131,61 @@ async def test_a_closed_device_terminates_the_source_cleanly(fake_transport_modu
                     'the source to terminate')
     assert transport.source.terminated.exception() is None
     await transport.close()
+
+
+async def test_close_closes_the_device_even_when_the_pumps_fail(
+    fake_transport_module, monkeypatch
+):
+    """The comment claimed "unconditionally" long before the code delivered it.
+
+    A pump that raised on the way down skipped the device close entirely. Because
+    the device is exclusive, the leaked handle then locked out every later open
+    until the garbage collector happened to reclaim it - which surfaced as
+    unrelated tests erroring with a message about the DACL, sending the reader
+    off to check permissions that were never the problem.
+    """
+    from bumble.transport.common import PumpedTransport
+
+    transport = await fake_transport_module.open_winvhci_transport()
+
+    async def boom(self):
+        raise RuntimeError('a pump failed on the way down')
+
+    monkeypatch.setattr(PumpedTransport, 'close', boom)
+
+    # The error must still propagate - swallowing it would trade one silent
+    # failure for another.
+    with pytest.raises(RuntimeError):
+        await transport.close()
+
+    assert transport.device.was_closed
+
+
+async def test_a_failed_setup_closes_the_device(fake_transport_module, monkeypatch):
+    """The window between opening the handle and returning the transport.
+
+    Everything after the open - starting the pumps, asking for the radio,
+    wrapping the snooper - has to hand the handle back if it raises, or the
+    caller has no reference with which to close it.
+    """
+    from bumble.transport.common import PumpedTransport
+
+    created: list[FakeDevice] = []
+
+    class RecordingDevice(FakeDevice):
+        def __init__(self, path: str) -> None:
+            super().__init__(path)
+            created.append(self)
+
+    monkeypatch.setattr(fake_transport_module, 'VhciDevice', RecordingDevice)
+
+    def boom(self):
+        raise RuntimeError('the pumps would not start')
+
+    monkeypatch.setattr(PumpedTransport, 'start', boom)
+
+    with pytest.raises(RuntimeError):
+        await fake_transport_module.open_winvhci_transport()
+
+    assert created, 'the device was never constructed'
+    assert created[0].was_closed

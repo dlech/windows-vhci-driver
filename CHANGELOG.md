@@ -12,6 +12,14 @@ the supported runner images.
 
 ## [Unreleased]
 
+### Fixed
+
+- A failure while opening or closing a transport no longer leaks the device
+  handle. Because the device is exclusive, a leaked handle locked out every
+  later open until the garbage collector reclaimed it.
+- The "access denied" message now says the device may simply be open already,
+  instead of blaming the DACL for what is usually a handle still in use.
+
 ## [1.2.0] - 2026-09-05
 
 ### Added
