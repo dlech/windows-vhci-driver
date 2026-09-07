@@ -714,12 +714,20 @@ class VhciDevice:
 
 def _explain_open_failure(path: str, error: int) -> str:
     if error == _ERROR_ACCESS_DENIED:
+        # Two unrelated causes share this error code, and CreateFile gives no
+        # way to tell them apart, so both have to be named. Mentioning only
+        # the DACL sends the reader to check permissions when the real problem
+        # is usually a handle that is still open.
         return (
-            f'access denied opening {path}. The device DACL allows SYSTEM and '
-            f'Administrators only; run elevated, or install with '
-            f'-AllowInteractiveUsers. An unelevated shell of an administrator '
-            f'account is not enough, because UAC leaves the Administrators SID '
-            f'deny-only in that token.'
+            f'access denied opening {path}. Two causes produce this same error '
+            f'and it cannot distinguish them. Either the device is already '
+            f'open - it is exclusive (WdfDeviceInitSetExclusive), one client '
+            f'at a time, so a previous client that has not yet closed its '
+            f'handle locks out the next one - or the DACL is refusing you: it '
+            f'allows SYSTEM and Administrators only, so run elevated or '
+            f'install with -AllowInteractiveUsers, and note that an unelevated '
+            f'shell of an administrator account is not enough because UAC '
+            f'leaves the Administrators SID deny-only in that token.'
         )
     if error == _ERROR_FILE_NOT_FOUND:
         return (

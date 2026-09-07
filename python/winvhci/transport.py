@@ -72,10 +72,18 @@ class _WinVhciTransport(PumpedTransport):
         self.radio_id: int | None = None
 
     async def close(self) -> None:
-        await super().close()
-        # Closing the handle is what destroys the radio PDO, so it happens last
-        # and unconditionally.
-        await asyncio.to_thread(self.device.close)
+        try:
+            await super().close()
+        finally:
+            # Closing the handle is what destroys the radio PDO, so it happens
+            # last and unconditionally - and the try/finally is what makes the
+            # second half of that true. Without it, a pump that fails on the
+            # way down leaves the handle open; because the device is exclusive
+            # the next open then fails with ERROR_ACCESS_DENIED until the
+            # garbage collector happens to reclaim it. That showed up as three
+            # tests in eight erroring under Python 3.14 while 3.12 ran clean,
+            # purely because collection timing differs.
+            await asyncio.to_thread(self.device.close)
 
 
 async def open_winvhci_transport(spec: str | None = None) -> Transport:
@@ -117,13 +125,24 @@ async def open_winvhci_transport(spec: str | None = None) -> Transport:
     sink = PumpedPacketSink(send)
     transport = _WinVhciTransport(source, sink, device)
 
-    # Start the pumps before asking for the radio: the sink queues packets and
-    # only its pump drains them, so a request written first would sit in the
-    # queue until something else happened to be sent.
-    transport.start()
-    sink.on_packet(bytes([HCI_VENDOR_PKT, HCI_BREDR]))
+    # Everything after the open has to hand the handle back on the way out.
+    # The device is exclusive, so a handle leaked here is not merely untidy: it
+    # locks out every subsequent open until the garbage collector reclaims it,
+    # and the error that arrives then names the DACL rather than the real
+    # cause.
+    try:
+        # Start the pumps before asking for the radio: the sink queues packets
+        # and only its pump drains them, so a request written first would sit
+        # in the queue until something else happened to be sent.
+        transport.start()
+        sink.on_packet(bytes([HCI_VENDOR_PKT, HCI_BREDR]))
 
-    return _with_snooper(transport, device)
+        return _with_snooper(transport, device)
+    except BaseException:
+        # BaseException rather than Exception: a cancellation arriving during
+        # setup would otherwise leak the handle just as effectively.
+        await asyncio.to_thread(device.close)
+        raise
 
 
 def _with_snooper(transport: _WinVhciTransport, device: VhciDevice) -> Transport:
