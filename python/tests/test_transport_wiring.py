@@ -138,11 +138,16 @@ async def test_close_closes_the_device_even_when_the_pumps_fail(
 ):
     """The comment claimed "unconditionally" long before the code delivered it.
 
-    A pump that raised on the way down skipped the device close entirely. Because
-    the device is exclusive, the leaked handle then locked out every later open
-    until the garbage collector happened to reclaim it - which surfaced as
-    unrelated tests erroring with a message about the DACL, sending the reader
-    off to check permissions that were never the problem.
+    A pump that raised on the way down skipped the device close entirely.
+    Because the device is exclusive, the leaked handle then locked out every
+    later open until the garbage collector happened to reclaim it, and the
+    error that arrived blamed the DACL rather than naming a handle still in
+    use.
+
+    This test is the evidence for the bug. It was found while chasing an
+    unrelated fault, and the access-denied errors that prompted the look had a
+    different cause - a second test loop still running and holding the device -
+    so nothing observed at the time demonstrated this path.
     """
     from bumble.transport.common import PumpedTransport
 
