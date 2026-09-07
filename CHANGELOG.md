@@ -14,6 +14,10 @@ the supported runner images.
 
 ### Fixed
 
+- `vhci-io.ps1` can read the driver's counters again. v1.2.0 added
+  `RadiosAlive` to `WINVHCI_STATS` and left the script's copy a field short, so
+  the driver refused every request; `test-write-gating.ps1` and
+  `vhcibridge.ps1 -Stats` both failed.
 - A failure while opening or closing a transport no longer leaks the device
   handle. Because the device is exclusive, a leaked handle locked out every
   later open until the garbage collector reclaimed it.

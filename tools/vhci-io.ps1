@@ -179,9 +179,13 @@ public static class VhciIo {
         (FILE_DEVICE_UNKNOWN << 16) | (FILE_READ_ACCESS << 14) |
         (0x800 << 2) | METHOD_BUFFERED;
 
-    // Mirrors WINVHCI_STATS. Size is the driver's own sizeof, so a mismatch
-    // between this declaration and the driver is detectable rather than
-    // silently misaligned.
+    // Mirrors WINVHCI_STATS, field for field and in order - the layout is
+    // sequential, so a field added to winvhci.h and not to this declaration
+    // does not merely mis-name a counter, it makes the buffer too short and
+    // the driver refuses the whole request with STATUS_BUFFER_TOO_SMALL. The
+    // Size check below then never runs, because there is nothing to check.
+    // That is how v1.2.0 broke this script: RadiosAlive was added to the
+    // driver and to the Python client, and not here.
     [StructLayout(LayoutKind.Sequential)]
     public struct Stats {
         public uint Size;
@@ -196,6 +200,7 @@ public static class VhciIo {
         public uint WritesTotal;
         public uint QueuedToUserTotal;
         public uint WritesNoRadio;
+        public uint RadiosAlive;
     }
 
     public static Stats GetStats() {
@@ -206,8 +211,20 @@ public static class VhciIo {
             if (!DeviceIoControl(_handle, IOCTL_WINVHCI_GET_STATS,
                                  IntPtr.Zero, 0, buf, (uint)size,
                                  out returned, IntPtr.Zero)) {
-                throw new Win32Exception(Marshal.GetLastWin32Error(),
-                                         "DeviceIoControl(GET_STATS) failed");
+                int err = Marshal.GetLastWin32Error();
+                // ERROR_INSUFFICIENT_BUFFER means this declaration is shorter
+                // than the driver's struct. The driver completes the request
+                // with the size it needs in the Information field precisely so
+                // the caller can say which build it is out of step with, so
+                // report it rather than a bare "failed" that sends the reader
+                // looking at the IOCTL definition.
+                if (err == 122 && returned > size) {
+                    throw new InvalidOperationException(
+                        "WINVHCI_STATS size mismatch: the driver needs " +
+                        returned + " bytes, this script declares " + size +
+                        ". vhci-io.ps1 is older than the installed driver.");
+                }
+                throw new Win32Exception(err, "DeviceIoControl(GET_STATS) failed");
             }
             Stats s = (Stats)Marshal.PtrToStructure(buf, typeof(Stats));
             if (s.Size != size) {
@@ -250,6 +267,7 @@ function Format-VhciStats {
     "$Prefix stack->user  depth $($s.HostToCtrlCount)  peak $($s.HostToCtrlPeak)   (unbounded by design)"
     "$Prefix user->stack  events depth $($s.PendingEventCount) peak $($s.PendingEventPeak)   acl depth $($s.PendingDataCount) peak $($s.PendingDataPeak)"
     "$Prefix refused      no-radio $($s.WritesNoRadio)"
+    "$Prefix radios       alive $($s.RadiosAlive)   (non-zero until PnP finishes removing one)"
 }
 
 # H4 packet type bytes.
