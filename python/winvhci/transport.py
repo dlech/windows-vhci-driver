@@ -80,9 +80,14 @@ class _WinVhciTransport(PumpedTransport):
             # second half of that true. Without it, a pump that fails on the
             # way down leaves the handle open; because the device is exclusive
             # the next open then fails with ERROR_ACCESS_DENIED until the
-            # garbage collector happens to reclaim it. That showed up as three
-            # tests in eight erroring under Python 3.14 while 3.12 ran clean,
-            # purely because collection timing differs.
+            # garbage collector happens to reclaim it.
+            #
+            # This was found while chasing an unrelated fault and is a latent
+            # defect, not the explanation for anything observed: the
+            # access-denied errors that prompted the look turned out to be a
+            # second test loop that was still running and holding the device.
+            # The regression tests in test_transport_wiring.py are what
+            # demonstrate the bug.
             await asyncio.to_thread(self.device.close)
 
 
