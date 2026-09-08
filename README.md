@@ -82,9 +82,45 @@ by commit SHA and lets Dependabot move the pin, and publishing a mutable tag it 
 itself consume would be inconsistent — so pin the action ref, and keep it equal to `version:`,
 which is what the release was tested as.
 
-Runs on `windows-2025` and `windows-11-vs2026-arm`. Not `windows-2022`: the driver loads, but
-`Radio.RequestAccessAsync` returns `DeniedByUser` and the user-mode Bluetooth services are
-absent.
+### Supported runners
+
+Use a **Windows client** runner: `windows-11-arm` or `windows-11-vs2026-arm`. On GitHub these
+are the only Windows client images, and they are free for public repositories.
+
+**Windows Server runners are not supported.** The driver loads on them and the Bluetooth stack
+appears to work, which is misleading. Microsoft does not document Bluetooth as supported there
+— the [Bluetooth developer FAQ][faq] says LE functionality "is in OneCore and should be
+available on most recent devices", then adds the caveat that "some Windows Server Editions
+don't support Bluetooth", naming none and saying nothing either way about Server 2025.
+
+More concretely, `windows-2025` ships Bluetooth bugs that have since been fixed elsewhere. Its
+OS is serviced to 10.0.26100.33296 and its user-mode Bluetooth binaries with it, but
+`bthport.sys` and `bthenum.sys` — the two Bluetooth *kernel* drivers — are still at
+10.0.26100.1, the original RTM build, 33295 revisions behind everything around them:
+
+| | `windows-2025` | `windows-11-vs2026-arm` |
+| --- | --- | --- |
+| Edition | Server 2025 Datacenter | Windows 11 Enterprise |
+| `bthport.sys` | **10.0.26100.1** | 10.0.26100.8655 |
+| `bthenum.sys` | **10.0.26100.1** | 10.0.26100.8655 |
+| `bthmini.sys` | 10.0.26100.33296 | 10.0.26100.8972 |
+| `BluetoothApis.dll` | 10.0.26100.33158 | 10.0.26100.8972 |
+
+An intermittent GATT discovery failure — `GetGattServicesAsync` returning
+`ERROR_FILE_NOT_FOUND` after completing the whole discovery correctly on air — occurred 19
+times in 448 tests on `windows-2025` and 0 times in 448 on `windows-11-vs2026-arm`, with the
+same commit, driver and tests. Days went into investigating it before the platform was the
+suspect. Do not spend that time again.
+
+`windows-2022` is not supported either, for an unrelated reason: `Radio.RequestAccessAsync`
+returns `DeniedByUser` and the user-mode Bluetooth services are absent, so WinRT Bluetooth
+cannot be used even though the driver loads.
+
+The x64 package is built, signed and released, because real users run x64 — but CI cannot
+Bluetooth-test it, since GitHub offers no Windows 11 x64 client runner. That gap is stated
+rather than hidden.
+
+[faq]: https://learn.microsoft.com/en-us/windows/apps/develop/devices-sensors/bluetooth-dev-faq
 
 The action installs the driver and stops there — it deliberately does not create a radio,
 because the radio's lifetime is a device handle's lifetime and the test process has to own it

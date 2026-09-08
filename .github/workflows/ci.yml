@@ -4,19 +4,47 @@
 # No VM is involved. GitHub's Windows runner images run
 # `bcdedit.exe /set TESTSIGNING ON` at image build time and assert it in an
 # image validation test, so a self-signed test-signed driver loads directly on a
-# runner. build\ci\probe-runner.ps1 confirmed that on all four images, along
-# with the more surprising half: bth.inf, with MS_BTHX_BTHMINI and an NTamd64
-# section, is present on the Windows Server images too - so x64 can be
-# load-tested on a free runner just as ARM64 can.
+# runner.
+#
+# ANYTHING THAT EXERCISES BLUETOOTH RUNS ON A WINDOWS CLIENT RUNNER ONLY.
+#
+# build\ci\probe-runner.ps1 found bth.inf present on the Windows Server images
+# too, with MS_BTHX_BTHMINI and an NTamd64 section, and this file used to
+# conclude from that that "x64 can be load-tested on a free runner just as
+# ARM64 can". That was wrong: the stack being present is not the same as it
+# being supported, and Server is not a supported platform for Bluetooth.
+#
+# Microsoft does not document it as one. The Bluetooth developer FAQ says LE
+# functionality "is in OneCore and should be available on most recent devices",
+# then adds the caveat that "some Windows Server Editions don't support
+# Bluetooth" - naming no editions, and with nothing affirming support on
+# Server 2025 either way.
+#
+# More concretely, windows-2025 ships Bluetooth bugs that have since been
+# fixed. Its OS is serviced to 10.0.26100.33296 and its user-mode Bluetooth
+# binaries with it, but bthport.sys and bthenum.sys - the two Bluetooth KERNEL
+# drivers - are still at 10.0.26100.1, the original RTM build, 33295 revisions
+# behind everything around them. An intermittent GATT discovery failure in
+# Bleak's integration suite occurred 19 times in 448 tests on that image and 0
+# times in 448 on windows-11-vs2026-arm, whose bthport.sys is 10.0.26100.8655,
+# with the same commit, driver and tests throughout. Days went into chasing a
+# fault that only ever existed on an unsupported platform.
 #
 # Runner choices:
-#   windows-2025            x64 smoke. Server 2025, but it has the full
-#                           Bluetooth stack and Radio access is Allowed.
-#   windows-11-vs2026-arm   ARM64 smoke. Windows 11 client; the image
-#                           consumers of the eventual action would use.
-#   windows-2022            deliberately NOT used for smoke: RequestAccessAsync
-#                           returns DeniedByUser and the user-mode Bluetooth
-#                           services are absent.
+#   windows-11-vs2026-arm   ARM64 smoke and the consumer action. A genuine
+#                           Windows 11 client image, free for public repos, and
+#                           the image a consumer of the action would use.
+#   windows-2025            BUILD ONLY. Compiling and signing the x64 package
+#                           has nothing to do with Bluetooth, and x64 is still
+#                           shipped because real users run it - it is just not
+#                           load-tested here.
+#   windows-2022            Not used at all: RequestAccessAsync returns
+#                           DeniedByUser and the user-mode Bluetooth services
+#                           are absent.
+#
+# x64 therefore builds and signs in CI but is not Bluetooth-tested by it. That
+# gap is real and is stated in the README rather than papered over; closing it
+# needs a Windows 11 x64 client machine, which GitHub does not offer.
 
 name: ci
 
@@ -113,6 +141,10 @@ jobs:
           path: artifacts/logs/
           if-no-files-found: ignore
 
+  # ARM64 only, and still a matrix so adding a Windows 11 x64 client runner is
+  # a one-line change if GitHub ever offers one. See the header: Server is not
+  # a supported Bluetooth platform, and windows-2025 in particular still runs
+  # the RTM bthport.sys.
   smoke:
     name: smoke ${{ matrix.platform }} on ${{ matrix.runner }}
     needs: build
@@ -123,8 +155,6 @@ jobs:
         include:
           - platform: ARM64
             runner: windows-11-vs2026-arm
-          - platform: x64
-            runner: windows-2025
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -274,6 +304,9 @@ jobs:
   # It asserts what the PowerShell smoke test asserts at its core - that Windows
   # binds bth.inf and BthMini to the radio our driver invents - but through the
   # Python path, so a regression in either half is attributed correctly.
+  # ARM64 only, for the same reason as the smoke job. This one matters
+  # doubly: it is the path a consumer of actions/install actually takes, and
+  # a client runner is what they will be on.
   consumer:
     name: consumer action ${{ matrix.platform }} on ${{ matrix.runner }}
     needs: build
@@ -282,8 +315,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: x64
-            runner: windows-2025
           - platform: ARM64
             runner: windows-11-vs2026-arm
 

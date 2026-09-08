@@ -12,6 +12,19 @@ the supported runner images.
 
 ## [Unreleased]
 
+### Changed
+
+- **Windows Server runners are no longer supported.** Use a Windows client
+  runner: `windows-11-arm` or `windows-11-vs2026-arm`. Microsoft does not
+  document Bluetooth as supported on Server, and `windows-2025` still ships
+  `bthport.sys` and `bthenum.sys` at the RTM 10.0.26100.1 while its user-mode
+  Bluetooth binaries are serviced to .33296 — a GATT discovery fault reproduced
+  19 times in 448 tests there and 0 times in 448 on the ARM64 client runner.
+  The README has the detail. x64 is still built, signed and released; it just
+  is not Bluetooth-tested in CI, because GitHub offers no Windows 11 x64 client
+  runner.
+- The smoke and consumer-action jobs run on ARM64 only, for the same reason.
+
 ## [1.2.1] - 2026-09-07
 
 ### Fixed

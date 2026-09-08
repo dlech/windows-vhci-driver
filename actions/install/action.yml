@@ -24,14 +24,26 @@
 #     async with await open_winvhci_transport() as transport:
 #         ...
 #
-# Runner support:
-#   windows-2025            works. Server 2025, but it has the full Bluetooth
-#                           stack and Radio access is Allowed.
-#   windows-11-vs2026-arm   works. Windows 11 client, ARM64.
-#   windows-2022            NOT supported: Radio.RequestAccessAsync returns
-#                           DeniedByUser and the user-mode Bluetooth services
-#                           are absent, so WinRT Bluetooth cannot be used even
-#                           though the driver itself loads.
+# Runner support - use a Windows CLIENT runner:
+#   windows-11-arm          supported. Windows 11 client, ARM64.
+#   windows-11-vs2026-arm   supported. Same, with VS 2026; pinned by this
+#                           repository's own CI.
+#
+#   Windows Server runners  NOT supported, and misleadingly so: the driver
+#                           loads and the stack appears to work. Microsoft does
+#                           not document Bluetooth as supported on Server - the
+#                           Bluetooth developer FAQ notes that "some Windows
+#                           Server Editions don't support Bluetooth" - and
+#                           windows-2025 still ships bthport.sys and
+#                           bthenum.sys at the RTM 10.0.26100.1 while its
+#                           user-mode Bluetooth binaries are serviced to
+#                           .33296. An intermittent GATT discovery failure
+#                           reproduced 19 times in 448 tests there and 0 times
+#                           in 448 on the ARM64 client runner. See the README.
+#   windows-2022            NOT supported, separately: Radio.RequestAccessAsync
+#                           returns DeniedByUser and the user-mode Bluetooth
+#                           services are absent, so WinRT Bluetooth cannot be
+#                           used even though the driver itself loads.
 
 name: Install winvhci
 description: Install the winvhci virtual Bluetooth HCI controller so Windows presents a virtual Bluetooth radio
