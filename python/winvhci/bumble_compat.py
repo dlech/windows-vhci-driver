@@ -266,7 +266,8 @@ class WindowsCompatController(Controller):
     # Several of these have no return-parameter class in bumble.hci at all,
     # which makes Bumble treat them as asynchronous commands and discard the
     # unknown-command status its own fallback produced. Hence the raw helper
-    # below rather than a returned object.
+    # below, which sends the bytes itself for those and hands back a proper
+    # return-parameters object for the commands Bumble does model.
 
     @staticmethod
     def _connection_handle(command) -> int:
@@ -282,13 +283,30 @@ class WindowsCompatController(Controller):
             return handle
         return int.from_bytes(command.parameters[:2], "little")
 
-    def _command_complete(self, command, payload: bytes) -> None:
-        """Send a Command Complete carrying raw return parameters.
+    def _command_complete(self, command, payload: bytes):
+        """Answer a command with return parameters given as raw bytes.
 
-        For commands bumble.hci has no ReturnParameters class for. The bytes are
-        the return parameters exactly as the Core specification lays them out,
-        starting with the status octet.
+        The bytes are the return parameters exactly as the Core specification
+        lays them out, starting with the status octet. How they reach the wire
+        depends on how the installed Bumble models the command, and the handler
+        must return whatever this returns:
+
+        * Bumble 0.0.234 onwards classifies commands with a return-parameters
+          class as ``HCI_SyncCommand``. For those the handler has to RETURN the
+          parameters and Bumble sends the Command Complete itself; a handler
+          that sent its own and returned None was correct on the wire but made
+          Bumble log ``Sync command handlers should return parameters, got
+          None`` - an ERROR per command, on a command Windows sends for every
+          LE connection. So parse the bytes into the class Bumble expects.
+
+        * Otherwise there is no class to return - the command is unmodelled, or
+          the Bumble is older - so send a raw Command Complete here and return
+          None, which is Bumble's convention for an asynchronous handler.
         """
+        sync_command = getattr(hci, 'HCI_SyncCommand', None)
+        if sync_command is not None and isinstance(command, sync_command):
+            return type(command).parse_return_parameters(payload)
+
         self.send_hci_packet(
             hci.HCI_Command_Complete_Event(
                 num_hci_command_packets=1,
@@ -296,6 +314,7 @@ class WindowsCompatController(Controller):
                 return_parameters=RawReturnParameters(payload),
             )
         )
+        return None
 
     def on_hci_le_read_channel_map_command(self, command):
         """Status, handle, and a 5-octet channel map.
@@ -304,40 +323,36 @@ class WindowsCompatController(Controller):
         link has no adaptive frequency hopping to report, so the honest answer
         is the full map.
         """
-        self._command_complete(
+        return self._command_complete(
             command,
             bytes([hci.HCI_ErrorCode.SUCCESS])
             + self._connection_handle(command).to_bytes(2, "little")
             + bytes([0xFF, 0xFF, 0xFF, 0xFF, 0x1F]),
         )
-        return None
 
     def on_hci_le_set_data_length_command(self, command):
         """Accept the requested PDU length; reply is status and handle."""
-        self._command_complete(
+        return self._command_complete(
             command,
             bytes([hci.HCI_ErrorCode.SUCCESS])
             + self._connection_handle(command).to_bytes(2, "little"),
         )
-        return None
 
     def on_hci_read_authenticated_payload_timeout_command(self, command):
         """Status, handle, timeout in units of 10 ms. 0x0BB8 is the 30 s default."""
-        self._command_complete(
+        return self._command_complete(
             command,
             bytes([hci.HCI_ErrorCode.SUCCESS])
             + self._connection_handle(command).to_bytes(2, "little")
             + (0x0BB8).to_bytes(2, "little"),
         )
-        return None
 
     def on_hci_write_authenticated_payload_timeout_command(self, command):
-        self._command_complete(
+        return self._command_complete(
             command,
             bytes([hci.HCI_ErrorCode.SUCCESS])
             + self._connection_handle(command).to_bytes(2, "little"),
         )
-        return None
 
     def on_hci_le_connection_update_command(self, command):
         """Command Status now, LE Connection Update Complete after.

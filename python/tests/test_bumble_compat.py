@@ -15,6 +15,9 @@ exist now.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import pytest
 
 import bumble
@@ -215,3 +218,45 @@ def test_superseded_handlers_are_actually_bumbles():
             f'{name} was dropped as superseded, but Bumble '
             f'{bumble.__version__} does not implement it'
         )
+
+
+@pytest.mark.asyncio
+async def test_raw_reply_handlers_answer_once_and_quietly(caplog):
+    """A connection-time command gets exactly one Command Complete, and no ERROR.
+
+    Bumble 0.0.234 models LE_Set_Data_Length as a synchronous command, so the
+    handler has to return the parameters for Bumble to send. The shim used to
+    send its own Command Complete and return None, which was right on the wire
+    and wrong in the log: Bumble reported "Sync command handlers should return
+    parameters, got None" for every one, on a command Windows issues for every
+    LE connection. Whichever shape the installed Bumble has, the host must see
+    one reply carrying status SUCCESS and the handle, and nothing must be
+    logged at ERROR.
+    """
+    controller = WindowsCompatController('test', link=WindowsCompatLink())
+    sent: list[bytes] = []
+
+    class Host:
+        def on_packet(self, packet: bytes) -> None:
+            sent.append(bytes(packet))
+
+    controller.host = Host()
+    command = hci.HCI_LE_Set_Data_Length_Command(
+        connection_handle=0x0040, tx_octets=27, tx_time=328
+    )
+
+    with caplog.at_level(logging.ERROR, logger='bumble.controller'):
+        controller.on_hci_command_packet(command)
+        # send_hci_packet hands the bytes to the host via call_soon.
+        await asyncio.sleep(0)
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not errors, f'Bumble complained: {errors}'
+
+    assert len(sent) == 1, f'expected one reply, got {len(sent)}'
+    reply = sent[0]
+    # 04 (H4 event) 0E (Command Complete) <len> <num packets> <opcode lo hi>
+    # <return parameters>. The parameters are status then the handle.
+    assert reply[0:2] == bytes([0x04, 0x0E])
+    assert int.from_bytes(reply[4:6], 'little') == command.op_code
+    assert reply[6:] == bytes([hci.HCI_ErrorCode.SUCCESS]) + (0x0040).to_bytes(2, 'little')
