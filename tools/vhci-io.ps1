@@ -21,6 +21,8 @@ public static class VhciIo {
     const uint OPEN_EXISTING        = 3;
     const uint FILE_FLAG_OVERLAPPED = 0x40000000;
     const int  ERROR_IO_PENDING     = 997;
+    const int  ERROR_OPERATION_ABORTED   = 995;
+    const int  ERROR_INSUFFICIENT_BUFFER = 122;
     const uint WAIT_OBJECT_0        = 0;
     const uint WAIT_TIMEOUT         = 258;
 
@@ -34,7 +36,7 @@ public static class VhciIo {
         IntPtr sec, uint disposition, uint flags, IntPtr template);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool ReadFile(IntPtr h, byte[] buf, int toRead, IntPtr read, IntPtr ov);
+    static extern bool ReadFile(IntPtr h, IntPtr buf, int toRead, IntPtr read, IntPtr ov);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool WriteFile(IntPtr h, byte[] buf, int toWrite, IntPtr written, IntPtr ov);
@@ -72,6 +74,11 @@ public static class VhciIo {
     static IntPtr _ov     = IntPtr.Zero;
 
     public static void Open(string path) {
+        // This type is static and outlives any one script, so an Open without
+        // a Close in between would leak the previous event and OVERLAPPED.
+        // Release whatever is there first; Close is safe when nothing is.
+        Close();
+
         // Share mode 0: the driver is exclusive anyway, and asking for sharing
         // would only hide a second client behind a confusing error later.
         _handle = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0,
@@ -94,32 +101,63 @@ public static class VhciIo {
     public static int Read(byte[] buf, int timeoutMs) {
         PrepareOverlapped();
 
-        int n;
-        if (ReadFile(_handle, buf, buf.Length, IntPtr.Zero, _ov)) {
-            GetOverlappedResult(_handle, _ov, out n, false);
-            return n;
-        }
+        // The buffer stays PINNED until the request has been collected, on
+        // every path out of here. A byte[] handed straight to a P/Invoke is
+        // pinned only for the duration of that call - and ReadFile returns
+        // with the request still pending. The device uses buffered I/O, so
+        // the kernel copies the packet to the buffer's address when the
+        // request completes, later; if the garbage collector has compacted
+        // the heap in between, the array has moved and the packet lands on
+        // whatever object lives at the old address now. The bridge issues one
+        // of these every 50 ms for hours, so that is not a hypothetical.
+        GCHandle pin = GCHandle.Alloc(buf, GCHandleType.Pinned);
+        try {
+            int n;
+            if (ReadFile(_handle, pin.AddrOfPinnedObject(), buf.Length, IntPtr.Zero, _ov)) {
+                GetOverlappedResult(_handle, _ov, out n, false);
+                return n;
+            }
 
-        int err = Marshal.GetLastWin32Error();
-        if (err != ERROR_IO_PENDING) {
-            throw new Win32Exception(err, "ReadFile failed");
-        }
+            int err = Marshal.GetLastWin32Error();
+            if (err != ERROR_IO_PENDING) {
+                throw new Win32Exception(err, "ReadFile failed");
+            }
 
-        uint wait = WaitForSingleObject(_event, (uint)timeoutMs);
-        if (wait == WAIT_TIMEOUT) {
-            // Cancel and reap, so the next read starts from a clean state.
+            uint wait = WaitForSingleObject(_event, (uint)timeoutMs);
+            if (wait == WAIT_OBJECT_0) {
+                if (!GetOverlappedResult(_handle, _ov, out n, false)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "GetOverlappedResult failed");
+                }
+                return n;
+            }
+
+            // Timed out, or the wait itself failed. Either way cancel and
+            // collect the request, so the next read starts from a clean state
+            // and the buffer is not unpinned with a request still targeting it.
+            //
+            // The request can complete WITH DATA between the wait expiring
+            // and the cancel landing: the driver dequeues a read under its lock
+            // and completes it outside, and a cancel is a no-op on a request
+            // that has already completed. That packet is real and is returned.
+            // This used to return 0 regardless, and the packet - an HCI
+            // command from the stack, typically - vanished, which from the
+            // outside looked like a controller that had not answered.
             CancelIoEx(_handle, _ov);
-            GetOverlappedResult(_handle, _ov, out n, true);
-            return 0;
+            bool completed = GetOverlappedResult(_handle, _ov, out n, true);
+            if (wait != WAIT_TIMEOUT) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "wait failed");
+            }
+            if (completed) {
+                return n;
+            }
+            int reap = Marshal.GetLastWin32Error();
+            if (reap == ERROR_OPERATION_ABORTED) {
+                return 0;
+            }
+            throw new Win32Exception(reap, "collecting the cancelled read failed");
+        } finally {
+            pin.Free();
         }
-        if (wait != WAIT_OBJECT_0) {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "wait failed");
-        }
-
-        if (!GetOverlappedResult(_handle, _ov, out n, false)) {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "GetOverlappedResult failed");
-        }
-        return n;
     }
 
     public static void Write(byte[] buf, int len) {
@@ -143,11 +181,25 @@ public static class VhciIo {
                 // bWait = true, which waits FOREVER - so the 5 s bound was
                 // decorative and a wedged device hung the caller outright with
                 // no way to tell it from a slow one.
-                if (WaitForSingleObject(evt, WRITE_TIMEOUT_MS) == WAIT_TIMEOUT) {
+                uint wait = WaitForSingleObject(evt, WRITE_TIMEOUT_MS);
+                if (wait != WAIT_OBJECT_0) {
                     CancelIoEx(_handle, ov);
                     // Collect the cancelled request so the OVERLAPPED is not
-                    // freed while the driver may still own it.
-                    GetOverlappedResult(_handle, ov, out n, true);
+                    // freed while the driver may still own it. If it completed
+                    // in the gap between the wait expiring and the cancel, the
+                    // write SUCCEEDED and is reported as such rather than as a
+                    // timeout that never happened.
+                    bool completed = GetOverlappedResult(_handle, ov, out n, true);
+                    if (wait != WAIT_TIMEOUT) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "wait failed");
+                    }
+                    if (completed) {
+                        return;
+                    }
+                    int reap = Marshal.GetLastWin32Error();
+                    if (reap != ERROR_OPERATION_ABORTED) {
+                        throw new Win32Exception(reap, "write did not complete");
+                    }
                     throw new TimeoutException(
                         "write did not complete within " + WRITE_TIMEOUT_MS +
                         " ms. The driver completes or fails every write, so " +
@@ -213,16 +265,21 @@ public static class VhciIo {
                                  out returned, IntPtr.Zero)) {
                 int err = Marshal.GetLastWin32Error();
                 // ERROR_INSUFFICIENT_BUFFER means this declaration is shorter
-                // than the driver's struct. The driver completes the request
-                // with the size it needs in the Information field precisely so
-                // the caller can say which build it is out of step with, so
-                // report it rather than a bare "failed" that sends the reader
-                // looking at the IOCTL definition.
-                if (err == 122 && returned > size) {
+                // than the driver's struct: the driver refuses the whole
+                // request with STATUS_BUFFER_TOO_SMALL rather than fill what
+                // fits. It also records the size it needs in the request's
+                // Information field, but that never reaches a Win32 caller -
+                // for an error status DeviceIoControl reports zero bytes
+                // returned - so the error code is the only signal there is.
+                // This branch used to require returned > size as well, which
+                // made it unreachable, and the very mismatch it describes
+                // (v1.2.0 adding RadiosAlive) surfaced as a bare "failed" that
+                // sent the reader looking at the IOCTL definition.
+                if (err == ERROR_INSUFFICIENT_BUFFER) {
                     throw new InvalidOperationException(
-                        "WINVHCI_STATS size mismatch: the driver needs " +
-                        returned + " bytes, this script declares " + size +
-                        ". vhci-io.ps1 is older than the installed driver.");
+                        "WINVHCI_STATS size mismatch: the driver refused a " +
+                        size + "-byte buffer as too small, so its struct has " +
+                        "grown. vhci-io.ps1 is older than the installed driver.");
                 }
                 throw new Win32Exception(err, "DeviceIoControl(GET_STATS) failed");
             }
@@ -239,11 +296,34 @@ public static class VhciIo {
         }
     }
 
+    // Issues IOCTL_WINVHCI_GET_STATS with an output buffer of exactly
+    // outLen bytes and returns the Win32 error, 0 on success, with the byte
+    // count DeviceIoControl reported. For tests of the size-mismatch contract
+    // above: a buffer shorter than the driver's struct must come back as
+    // ERROR_INSUFFICIENT_BUFFER with nothing returned.
+    public static int ProbeStatsSize(int outLen, out uint returned) {
+        IntPtr buf = Marshal.AllocHGlobal(Math.Max(outLen, 1));
+        try {
+            if (DeviceIoControl(_handle, IOCTL_WINVHCI_GET_STATS,
+                                IntPtr.Zero, 0, buf, (uint)outLen,
+                                out returned, IntPtr.Zero)) {
+                return 0;
+            }
+            return Marshal.GetLastWin32Error();
+        } finally {
+            Marshal.FreeHGlobal(buf);
+        }
+    }
+
     public static void Close() {
         if (_handle != IntPtr.Zero && _handle != (IntPtr)(-1)) { CloseHandle(_handle); }
         if (_event  != IntPtr.Zero) { CloseHandle(_event); }
         if (_ov     != IntPtr.Zero) { Marshal.FreeHGlobal(_ov); }
+        // All three, not just the handle: a second Close used to free _ov
+        // again, and Open used to allocate over whatever was still here.
         _handle = IntPtr.Zero;
+        _event  = IntPtr.Zero;
+        _ov     = IntPtr.Zero;
     }
 }
 '@

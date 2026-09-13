@@ -72,6 +72,10 @@ try {
     # WritesPended is ambiguous, which cost a whole test run to work out.
     $toController = 0
     $toDriver     = 0
+    # Frames the driver refused because the radio was not in D0 - toggled
+    # off, the system asleep, or the stack having given up on it. Dropped
+    # here rather than fatal: the link is fine and the radio may come back.
+    $notReady     = 0
 
     $deadline = if ($Seconds -gt 0) { (Get-Date).AddSeconds($Seconds) } else { [DateTime]::MaxValue }
     $nextStats = if ($Stats -gt 0) { (Get-Date).AddSeconds($Stats) } else { [DateTime]::MaxValue }
@@ -80,7 +84,7 @@ try {
 
         if ((Get-Date) -ge $nextStats) {
             Write-Host ("stats at {0}" -f (Get-Date -Format HH:mm:ss)) -ForegroundColor Cyan
-            Write-Host ("   bridge       ->controller $toController   ->driver $toDriver")
+            Write-Host ("   bridge       ->controller $toController   ->driver $toDriver   dropped (radio not ready) $notReady")
             Format-VhciStats ([VhciIo]::GetStats()) | ForEach-Object { Write-Host $_ }
             $nextStats = (Get-Date).AddSeconds($Stats)
         }
@@ -162,10 +166,9 @@ try {
             while ($accLen -gt 0) {
                 $frameLen = Get-H4FrameLength $acc $accLen
                 if ($frameLen -eq 0) {
-                    # A frame that cannot fit is the only genuine framing error
-                    # left: the longest H4 packet the driver accepts is 1026
-                    # bytes, so a full accumulator with no complete frame in it
-                    # means the stream is not H4.
+                    # A full accumulator with no complete frame in it means the
+                    # stream is not H4: no frame the driver accepts is anywhere
+                    # near this long.
                     if ($accLen -eq $acc.Length) {
                         throw ("no complete H4 frame in $accLen buffered bytes " +
                                '- the controller is not speaking H4')
@@ -173,11 +176,36 @@ try {
                     break                          # need more bytes
                 }
 
+                # A well-formed frame can still be one the driver cannot take:
+                # the H4 length fields allow ACL up to 65540 bytes, the device
+                # at most 1026 (a type byte, the 4-byte ACL header and
+                # MaxAclTransferInSize). Say so by name; the raw WriteFile
+                # failure this used to produce read as a device fault.
+                if ($frameLen -gt $devBuf.Length) {
+                    throw ("controller sent a $frameLen-byte H4 frame; the driver accepts " +
+                           "at most $($devBuf.Length) bytes")
+                }
+
                 $frame = New-Object byte[] $frameLen
                 [Array]::Copy($acc, 0, $frame, 0, $frameLen)
                 Write-Frame '<-' $frame $frameLen
-                [VhciIo]::Write($frame, $frameLen)
-                $toDriver++
+                try {
+                    [VhciIo]::Write($frame, $frameLen)
+                    $toDriver++
+                } catch [System.ComponentModel.Win32Exception] {
+                    # ERROR_NOT_READY: the radio exists but its stack is not
+                    # consuming - the PDO has left D0. A controller that is
+                    # still talking at that moment is not wrong, and neither
+                    # is the link, so this is not a reason to exit and take
+                    # the radio with us. Drop the frame, count it, and carry
+                    # on; the counter is in the stats line.
+                    if ($_.Exception.NativeErrorCode -ne 21) { throw }
+                    if ($notReady -eq 0) {
+                        Write-Host 'driver refused a frame: the radio is not ready (not in D0); dropping until it is' `
+                            -ForegroundColor Yellow
+                    }
+                    $notReady++
+                }
 
                 $accLen -= $frameLen
                 if ($accLen -gt 0) { [Array]::Copy($acc, $frameLen, $acc, 0, $accLen) }
@@ -190,7 +218,7 @@ try {
     # closing it also resets the backlogs.
     if ($Stats -gt 0) {
         Write-Host 'final stats' -ForegroundColor Cyan
-        Write-Host ("   bridge       ->controller $toController   ->driver $toDriver")
+        Write-Host ("   bridge       ->controller $toController   ->driver $toDriver   dropped (radio not ready) $notReady")
         try   { Format-VhciStats ([VhciIo]::GetStats()) | ForEach-Object { Write-Host $_ } }
         catch { Write-Host "  could not read stats: $($_.Exception.Message)" -ForegroundColor Yellow }
     }

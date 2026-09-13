@@ -40,6 +40,12 @@
 #      analogue. winvhci used to accept all four and ignore them.
 #   6. Flooding events loses nothing, and WritesTotal accounts for exactly
 #      what was sent.
+#   7. A packet larger than the stack's read buffer can carry - 257 bytes for
+#      an event, 1021 for ACL - is refused at the write, where the sender can
+#      be told, rather than accepted and then failed against the stack's read.
+#   8. Closing and reopening back to back gives a second radio that stays
+#      writable: the first radio's shutdown, which arrives asynchronously, must
+#      not take the new one down with it.
 #
 # HISTORY WORTH KNOWING BEFORE CHANGING THIS
 #
@@ -62,8 +68,18 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'vhci-io.ps1')
 
-# STATUS_DEVICE_NOT_READY surfaces to Win32 as ERROR_NOT_READY.
-$ERROR_NOT_READY = 21
+# STATUS_DEVICE_NOT_READY surfaces to Win32 as ERROR_NOT_READY,
+# STATUS_INVALID_PARAMETER as ERROR_INVALID_PARAMETER and
+# STATUS_BUFFER_TOO_SMALL as ERROR_INSUFFICIENT_BUFFER.
+$ERROR_NOT_READY           = 21
+$ERROR_INVALID_PARAMETER   = 87
+$ERROR_INSUFFICIENT_BUFFER = 122
+
+# Controller -> host packets have a ceiling set by the stack's read buffers:
+# an event is at most 2 header bytes + 255 parameter bytes, and an ACL
+# packet at most MaxAclTransferInSize, which INCLUDES its 4-byte header.
+$MAX_EVENT_BODY = 257
+$MAX_ACL_BODY   = 1021
 
 $script:ok = $true
 function Assert([string]$Name, [bool]$Cond, [string]$Detail = '') {
@@ -128,6 +144,20 @@ try {
     $before = [VhciIo]::GetStats()
     Format-VhciStats $before | ForEach-Object { Write-Host $_ }
 
+    # The size-mismatch contract vhci-io.ps1's GetStats relies on: a buffer
+    # shorter than WINVHCI_STATS is refused outright with
+    # ERROR_INSUFFICIENT_BUFFER, and Win32 reports ZERO bytes returned for
+    # it - the driver puts the size it needs in the request's Information
+    # field, but an error status never carries that back to user mode. A
+    # message that waited for a non-zero count there could never appear,
+    # which is how the v1.2.0 struct change reached users as a bare "failed".
+    $probeReturned = [uint32]0
+    $probeErr = [VhciIo]::ProbeStatsSize(4, [ref]$probeReturned)
+    Assert 'a stats buffer that is too small is refused with ERROR_INSUFFICIENT_BUFFER' `
+           ($probeErr -eq $ERROR_INSUFFICIENT_BUFFER) "got $probeErr"
+    Assert 'and reports zero bytes returned, so the error code is the only signal' `
+           ($probeReturned -eq 0) "returned $probeReturned"
+
     Write-Host ''
     Write-Host 'before a radio exists:' -ForegroundColor Cyan
     $eventErr = Try-Write $adv
@@ -153,16 +183,22 @@ try {
     Write-Host ''
     Write-Host 'asking for a radio' -ForegroundColor Cyan
     [VhciIo]::Write([byte[]]@(0xFF, 0x00), 2)
+    # Wait for the radio to be STARTED, not merely enumerated. Writes are
+    # admitted from the PDO's D0Entry, which follows IRP_MN_START_DEVICE; the
+    # devnode is visible to Get-PnpDevice before its driver has even loaded,
+    # and on a first-time INF match that gap is seconds. Firing the writes on
+    # mere presence made the admitted-phase asserts below fail spuriously.
     $appeared = $false
     $by = (Get-Date).AddSeconds($SettleSec)
     while ((Get-Date) -lt $by) {
-        if (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
-                Where-Object { $_.InstanceId -like 'WINVHCI\RADIO*' -and $_.Problem -ne 'CM_PROB_PHANTOM' }) {
-            $appeared = $true; break
-        }
+        $r = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+                Where-Object { $_.InstanceId -like 'WINVHCI\RADIO*' -and $_.Problem -ne 'CM_PROB_PHANTOM' } |
+                Select-Object -First 1
+        if ($r -and $r.Status -eq 'OK') { $appeared = $true; break }
         Start-Sleep -Milliseconds 500
     }
-    Assert 'the radio appeared' $appeared "no WINVHCI\RADIO node within $SettleSec s"
+    Assert 'the radio appeared and started' $appeared `
+           "no WINVHCI\RADIO node reached Status OK within $SettleSec s"
 
     Write-Host ''
     Write-Host 'once a radio exists:' -ForegroundColor Cyan
@@ -178,6 +214,30 @@ try {
     $secondRadio = Try-Write ([byte[]]@(0xFF, 0x00))
     Assert 'a second radio request is refused' ($secondRadio -ne 0) `
            'a duplicate FF 00 succeeded; Linux answers -EBADFD'
+
+    Write-Host ''
+    Write-Host 'packets the stack could never receive:' -ForegroundColor Cyan
+    # One byte over each limit. The driver used to accept both: handed to a
+    # pended read, the oversized packet failed THAT request - the stack's,
+    # not the writer's - with STATUS_BUFFER_TOO_SMALL; parked on the backlog,
+    # the write succeeded and the packet was thrown away later when a read
+    # arrived. The only place the sender can be told is the write itself.
+    $bigEvent = New-Object byte[] (1 + $MAX_EVENT_BODY + 1)
+    $bigEvent[0] = 0x04; $bigEvent[1] = 0x3E; $bigEvent[2] = 0xFF
+    $bigAcl = New-Object byte[] (1 + $MAX_ACL_BODY + 1)
+    $bigAcl[0] = 0x02; $bigAcl[1] = 0x01
+    $sized = [VhciIo]::GetStats()
+    $bigEventErr = Try-Write $bigEvent
+    $bigAclErr   = Try-Write $bigAcl
+    $sizedAfter  = [VhciIo]::GetStats()
+    Assert "an event with a $($MAX_EVENT_BODY + 1)-byte body is refused with ERROR_INVALID_PARAMETER" `
+           ($bigEventErr -eq $ERROR_INVALID_PARAMETER) "got $bigEventErr"
+    Assert "an ACL packet with a $($MAX_ACL_BODY + 1)-byte body is refused with ERROR_INVALID_PARAMETER" `
+           ($bigAclErr -eq $ERROR_INVALID_PARAMETER) "got $bigAclErr"
+    Assert 'neither oversized packet was counted as written or queued' `
+           ($sizedAfter.WritesTotal -eq $sized.WritesTotal -and
+            $sizedAfter.PendingEventCount -eq 0 -and $sizedAfter.PendingDataCount -eq 0) `
+           "WritesTotal moved by $($sizedAfter.WritesTotal - $sized.WritesTotal), event depth $($sizedAfter.PendingEventCount), acl depth $($sizedAfter.PendingDataCount)"
 
     Write-Host ''
     Write-Host 'control packet validation, as Linux validates it:' -ForegroundColor Cyan
@@ -280,6 +340,52 @@ try {
         Assert 'the stale backlog was dropped when the stack went down' `
                ($down.PendingEventCount -eq 0 -and $down.PendingDataCount -eq 0) `
                "event depth $($down.PendingEventCount), acl depth $($down.PendingDataCount) - these would be replayed into the next radio"
+    }
+
+    # ---------------------------------------------------------------------
+    # Close and reopen back to back.
+    #
+    # The first radio is now being torn down, and its stack's shutdown - the
+    # PDO's D0Exit - arrives on a PnP thread some time after the handle
+    # closes. The driver used to keep a single "radio started" flag for the
+    # whole device, so if a client reopened and asked for a new radio inside
+    # that window, the OLD radio's D0Exit cleared the NEW radio's flag and
+    # every write from then on was refused with ERROR_NOT_READY, with no
+    # D0Entry ever coming to undo it. The flag is per radio now. This round
+    # is a best-effort detector - the ordering depends on PnP timing - but
+    # it is the shape of the client that hit it, so it stays.
+    #
+    # There is still no controller, so BthPort gives up on this radio about
+    # twelve seconds after it starts, and the writes below have to finish
+    # well inside that: admission is reached a second or two in, and the
+    # steady writing lasts five.
+    Write-Host ''
+    Write-Host 'closing and reopening back to back:' -ForegroundColor Cyan
+    [VhciIo]::Close()
+    [VhciIo]::Open($Device)
+    [VhciIo]::Write([byte[]]@(0xFF, 0x00), 2)
+
+    $firstAdmitted = $false
+    $by = (Get-Date).AddSeconds($SettleSec)
+    while ((Get-Date) -lt $by) {
+        if ((Try-Write $adv) -eq 0) { $firstAdmitted = $true; break }
+        Start-Sleep -Milliseconds 200
+    }
+    Assert 'the second radio admits writes' $firstAdmitted `
+           "no write was admitted within $SettleSec s of reopening"
+
+    if ($firstAdmitted) {
+        $again = [VhciIo]::GetStats()
+        $refusedLater = 0
+        $by = (Get-Date).AddSeconds(5)
+        while ((Get-Date) -lt $by) {
+            if ((Try-Write $adv) -ne 0) { $refusedLater++ }
+            Start-Sleep -Milliseconds 100
+        }
+        $againAfter = [VhciIo]::GetStats()
+        Assert 'the first radio going away did not take the second one down' `
+               ($refusedLater -eq 0 -and $againAfter.WritesNoRadio -eq $again.WritesNoRadio) `
+               "$refusedLater write(s) refused after admission; WritesNoRadio moved by $($againAfter.WritesNoRadio - $again.WritesNoRadio)"
     }
 }
 finally {

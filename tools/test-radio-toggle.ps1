@@ -37,7 +37,10 @@ if ($null -eq $bt) {
 Write-Host "radio: '$($bt.Name)'  state=$($bt.State)"
 
 $failed = $false
-for ($i = 1; $i -le $Cycles; $i++) {
+# Labelled, so a vanished radio can leave BOTH loops. A bare break here only
+# left the inner foreach; the next cycle then called SetStateAsync on a null
+# $bt, and the script died before printing its RESULT line.
+:cycles for ($i = 1; $i -le $Cycles; $i++) {
     Write-Host ''
     Write-Host "=== cycle $i/$Cycles ===" -ForegroundColor Cyan
 
@@ -54,7 +57,7 @@ for ($i = 1; $i -le $Cycles; $i++) {
         if ($null -eq $bt) {
             Write-Host "  set $target -> $r, but the radio vanished" -ForegroundColor Red
             $failed = $true
-            break
+            break cycles
         }
         $ok = ("$($bt.State)" -eq $target)
         Write-Host ("  set {0,-3} -> {1,-8} state now {2}" -f $target, $r, $bt.State) `

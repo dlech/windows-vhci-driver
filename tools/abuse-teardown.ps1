@@ -21,6 +21,10 @@ param(
     [string]$Bridge  = 'C:\tools\vhcibridge.ps1',
     # The self-contained client, used for the device-restart round below.
     [string]$Ctl     = 'C:\tools\vhcictl.ps1',
+    # The GATT client for the ACL round. Defaults to the script next to
+    # $Bridge, so a caller that relocates the tools - CI passes repository
+    # paths - gets the round rather than a silent skip.
+    [string]$Connect,
     [string]$RemoteHost = '10.0.2.2',
     [int]$Port       = 6402,
     [int]$SettleSec  = 20,
@@ -37,6 +41,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $Connect) {
+    $Connect = Join-Path (Split-Path -Parent $Bridge) 'win-ble-connect.ps1'
+}
 
 function Get-Radio {
     Get-PnpDevice -ErrorAction SilentlyContinue |
@@ -102,35 +110,54 @@ Write-Host '=== kill the client with ACL in flight ===' -ForegroundColor Cyan
 # only. This one kills in the middle of a GATT session, so ATT traffic is moving
 # over ACL and the ACL read queue and its backlog are the ones being torn down.
 #
-if (Test-Path 'C:\tools\win-ble-connect.ps1') {
+if (Test-Path $Connect) {
     $p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
         '-ExecutionPolicy','Bypass','-File',$Bridge,
         '-RemoteHost',$RemoteHost,'-Port',$Port
     ) -RedirectStandardOutput 'C:\abuse-acl.log' -RedirectStandardError 'C:\abuse-acl.err'
-    Start-Sleep -Seconds $SettleSec
 
-    $gatt = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
-        '-ExecutionPolicy','Bypass','-File','C:\tools\win-ble-connect.ps1'
-    ) -RedirectStandardOutput 'C:\abuse-gatt.log' -RedirectStandardError 'C:\abuse-gatt.err'
+    # The same wait as the numbered rounds, for the same reason. This round
+    # used to sleep and then assert only that no radio REMAINED, so when the
+    # bridge never connected - this is connection number Rounds+1 to one
+    # shared Bumble, exactly the drop described under the restart round -
+    # nothing was created, nothing was torn down, and it still printed "radio
+    # gone; machine alive".
+    $deadline = (Get-Date).AddSeconds($SettleSec)
+    $radio = $null
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 800
+        $radio = Get-Radio
+        if ($radio -and $radio.Status -eq 'OK') { break }
+    }
 
-    # Long enough to be inside service discovery / a characteristic read.
-    Start-Sleep -Seconds 12
-    Write-Host '  killing bridge during GATT traffic'
-    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 10
-    Stop-Process -Id $gatt.Id -Force -ErrorAction SilentlyContinue
-
-    $t0 = Get-Date
-    $deadline = $t0.AddSeconds($TeardownSec)
-    do { Start-Sleep -Milliseconds 500; $after = Get-Radio } while ($after -and (Get-Date) -lt $deadline)
-    if ($after) {
-        Write-Host '  FAIL: radio survived the client' -ForegroundColor Red
+    if (-not ($radio -and $radio.Status -eq 'OK')) {
+        Write-Host '  FAIL: radio never came up, so there was no GATT session to kill' -ForegroundColor Red
         $failures++
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     } else {
-        Write-Host '  radio gone; machine alive' -ForegroundColor Green
+        $gatt = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-ExecutionPolicy','Bypass','-File',$Connect
+        ) -RedirectStandardOutput 'C:\abuse-gatt.log' -RedirectStandardError 'C:\abuse-gatt.err'
+
+        # Long enough to be inside service discovery / a characteristic read.
+        Start-Sleep -Seconds 12
+        Write-Host '  killing bridge during GATT traffic'
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 10
+        Stop-Process -Id $gatt.Id -Force -ErrorAction SilentlyContinue
+
+        $t0 = Get-Date
+        $deadline = $t0.AddSeconds($TeardownSec)
+        do { Start-Sleep -Milliseconds 500; $after = Get-Radio } while ($after -and (Get-Date) -lt $deadline)
+        if ($after) {
+            Write-Host '  FAIL: radio survived the client' -ForegroundColor Red
+            $failures++
+        } else {
+            Write-Host '  radio gone; machine alive' -ForegroundColor Green
+        }
     }
 } else {
-    Write-Host '  skipped: win-ble-connect.ps1 not present' -ForegroundColor DarkGray
+    Write-Host "  skipped: $Connect not present" -ForegroundColor DarkGray
 }
 
 Write-Host ''
