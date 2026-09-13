@@ -24,9 +24,17 @@ Abstract:
           (!empty, empty)  -> dequeue the request and complete it
           (!empty, !empty) -> impossible
 
-    Backlogs are bounded and drop on overflow: a virtual controller that blocks
-    the host Bluetooth stack is far worse than one that loses a packet, and the
-    drop counter says when it happened.
+    "Impossible" holds only because BOTH halves of each rendezvous decide under
+    the one FDO lock: a read checks the backlog and parks itself in one locked
+    region, and a packet checks for a parked read and queues itself in another.
+    The stack-facing read path once split its two steps across separate locked
+    regions, and a packet arriving in the gap was queued while the read then
+    parked behind it - the third state, with nothing left to drain either.
+
+    Backlogs are unbounded and never drop while there is somewhere to deliver
+    (winvhci.h, "Backlog policy"). The admission checks in WinVhciDispatchWrite
+    - no radio, radio not started, packet too large for the stack's buffer -
+    are what make that safe.
 
 Environment:
 
@@ -82,7 +90,8 @@ WinVhciFreeList(
 
 VOID
 WinVhciRadioStackDown(
-    _In_ PWINVHCI_FDO_CONTEXT Ctx
+    _In_ PWINVHCI_FDO_CONTEXT Ctx,
+    _In_ ULONG                RadioId
     )
 /*++
 
@@ -90,6 +99,13 @@ Routine Description:
 
     The radio PDO has left D0, so the Bluetooth stack above it has stopped
     consuming. Called from the PDO's EvtDeviceD0Exit.
+
+    Only for the CURRENT radio. A client that closes and reopens quickly has a
+    new radio by the time the old PDO's D0Exit arrives - it runs on a PnP
+    thread, some time after the close - and that stale D0Exit used to clear
+    the new radio's RadioStarted and purge its backlogs, with no D0Entry ever
+    coming to undo it. From then on every write failed with
+    STATUS_DEVICE_NOT_READY. RadioId says which radio is really going down.
 
     Clearing RadioStarted is what makes the next write fail with
     STATUS_DEVICE_NOT_READY instead of queueing against nothing - winvhci's
@@ -107,6 +123,12 @@ Routine Description:
 --*/
 {
     WdfSpinLockAcquire(Ctx->Lock);
+    if (RadioId != Ctx->CurrentRadioId) {
+        WdfSpinLockRelease(Ctx->Lock);
+        KdPrint(("winvhci: radio %u stack down ignored; radio %u is current\n",
+                 RadioId, Ctx->CurrentRadioId));
+        return;
+    }
     Ctx->RadioStarted = FALSE;
     WinVhciFreeList(&Ctx->PendingEventList, &Ctx->PendingEventCount);
     WinVhciFreeList(&Ctx->PendingDataList,  &Ctx->PendingDataCount);
@@ -322,26 +344,54 @@ WinVhciEvtIoRead(
 // userspace -> stack
 // ---------------------------------------------------------------------------
 
-PWINVHCI_PACKET
-WinVhciTakePendingForStack(
+NTSTATUS
+WinVhciTakeOrParkForStack(
     _In_ PWINVHCI_FDO_CONTEXT Ctx,
-    _In_ UCHAR                Type
+    _In_ UCHAR                Type,
+    _In_ WDFREQUEST           Request,
+    _In_ WDFQUEUE             Queue,
+    _Outptr_result_maybenull_ PWINVHCI_PACKET *Taken
     )
+/*++
+
+Routine Description:
+
+    The read half of the controller-to-host rendezvous, as one atomic step:
+    take the head of the backlog for Type if there is one, otherwise park the
+    read. Same shape as WinVhciEvtIoRead on the userspace side, and for the
+    same reason - the check and the park must not be separable by a packet
+    arriving in between (see the rendezvous rule at the top of this file).
+
+    WdfRequestForwardToIoQueue may be called at DISPATCH_LEVEL, so holding the
+    spinlock across it is legitimate.
+
+--*/
 {
-    PWINVHCI_PACKET p    = NULL;
-    PLIST_ENTRY     head = (Type == WINVHCI_H4_ACL) ? &Ctx->PendingDataList
-                                                    : &Ctx->PendingEventList;
-    PULONG          count = (Type == WINVHCI_H4_ACL) ? &Ctx->PendingDataCount
-                                                     : &Ctx->PendingEventCount;
+    PLIST_ENTRY head  = (Type == WINVHCI_H4_ACL) ? &Ctx->PendingDataList
+                                                 : &Ctx->PendingEventList;
+    PULONG      count = (Type == WINVHCI_H4_ACL) ? &Ctx->PendingDataCount
+                                                 : &Ctx->PendingEventCount;
+    NTSTATUS    status = STATUS_SUCCESS;
+
+    *Taken = NULL;
 
     WdfSpinLockAcquire(Ctx->Lock);
     if (!IsListEmpty(head)) {
-        p = CONTAINING_RECORD(RemoveHeadList(head), WINVHCI_PACKET, Link);
+        *Taken = CONTAINING_RECORD(RemoveHeadList(head), WINVHCI_PACKET, Link);
         (*count)--;
+    } else {
+        status = WdfRequestForwardToIoQueue(Request, Queue);
+        if (NT_SUCCESS(status)) {
+            if (Type == WINVHCI_H4_ACL) {
+                Ctx->PendedDataReads++;
+            } else {
+                Ctx->PendedEventReads++;
+            }
+        }
     }
     WdfSpinLockRelease(Ctx->Lock);
 
-    return p;
+    return status;
 }
 
 static NTSTATUS
@@ -425,7 +475,13 @@ Routine Description:
         return STATUS_INVALID_DEVICE_STATE;
     }
     radioId = Ctx->NextRadioId++;
-    Ctx->RadioPresent = TRUE;
+    Ctx->RadioPresent    = TRUE;
+    //
+    // From here on, only this radio's PDO may set or clear RadioStarted. Set
+    // before the PDO exists, so its D0Entry - and any earlier radio's late
+    // D0Exit - is judged against the right id.
+    //
+    Ctx->CurrentRadioId  = radioId;
     WdfSpinLockRelease(Ctx->Lock);
 
     status = WinVhciAddRadio(Ctx->Device, radioId);
@@ -463,13 +519,14 @@ WinVhciDispatchWrite(
 
 Routine Description:
 
-    One userspace write, from the queue callback OR from the backpressure
-    drain. Both go through here so a re-released write is handled identically
-    to a fresh one - including being pended again, if the stack has filled the
-    backlog back up in the meantime.
+    One userspace write. Every path through here completes the request before
+    returning - writes are never pended, because the backlogs are unbounded
+    and there is nothing to wait for. (An earlier design pended writes against
+    a bounded backlog and re-dispatched them from a drain; see the backlog
+    policy in winvhci.h for why that was the wrong question to answer.)
 
-    The transfer length is taken from the request rather than passed in,
-    because the drain path has only the request.
+    The transfer length is taken from the request rather than from the queue
+    callback's argument, so this has exactly one source of truth for it.
 
 --*/
 {
@@ -504,6 +561,28 @@ Routine Description:
 
     case WINVHCI_H4_EVENT:
     case WINVHCI_H4_ACL:
+        //
+        // SIZE CHECK first. The stack's read buffers have room for exactly
+        // WINVHCI_MAX_EVENT_SIZE bytes of event and WINVHCI_MAX_ACL_TRANSFER_IN
+        // of ACL (header included), so a larger packet can never be
+        // delivered. It used to be admitted anyway: handed to a pended read it
+        // failed THAT request - the stack's - with STATUS_BUFFER_TOO_SMALL,
+        // and parked on a backlog it was accepted and silently freed when a
+        // read arrived. The write is the only place the sender can be told.
+        //
+        {
+            ULONG bodyLength = (ULONG)bufferLength - 1;
+            ULONG limit      = (type == WINVHCI_H4_ACL) ? WINVHCI_MAX_ACL_TRANSFER_IN
+                                                        : WINVHCI_MAX_EVENT_SIZE;
+
+            if (bodyLength > limit) {
+                KdPrint(("winvhci: type 0x%02x body of %u bytes exceeds the %u "
+                         "the stack can receive\n", type, bodyLength, limit));
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+        }
+
         //
         // ADMISSION CHECK, and the reason the backlogs below can be unbounded.
         // This is Linux's, from vhci_get_user:
@@ -647,8 +726,11 @@ Routine Description:
 
     if (OutputBufferLength < sizeof(WINVHCI_STATS)) {
         //
-        // Report what is needed, so a caller built against an older header
-        // learns the size rather than guessing.
+        // The size needed goes in Information for a kernel-mode caller's
+        // benefit only: for an error status Win32 reports zero bytes returned,
+        // so a user-mode client learns nothing from it and has to treat
+        // ERROR_INSUFFICIENT_BUFFER itself as "the driver's struct has grown".
+        // Both clients in this repository do.
         //
         WdfRequestCompleteWithInformation(Request,
                                           STATUS_BUFFER_TOO_SMALL,

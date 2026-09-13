@@ -41,9 +41,12 @@ Environment:
 #define WINVHCI_RADIO_COMPAT_ID   L"MS_BTHX_BTHMINI"
 
 //
-// Capabilities reported to BthPort. See docs/design.md, "Capabilities" -
-// ScoSupport is the value most likely to be rejected, so it is the first thing
-// to change if the stack refuses to come up.
+// MaxAclTransferInSize, as reported to BthPort in QUERY_CAPABILITIES: the most
+// ACL bytes the stack will take in one READ_HCI, INCLUDING the 4-byte ACL
+// header. Measured: the ACL reads the stack posts have exactly this much room
+// after the 5-byte context header (see WINVHCI_READ_TYPE_WORD_SIZE below). The
+// other capability worth knowing about, ScoSupport, is a registry knob - see
+// docs/design.md, "Capabilities".
 //
 #define WINVHCI_MAX_ACL_TRANSFER_IN 1021
 
@@ -84,6 +87,15 @@ Environment:
 // Largest HCI event: 2-byte header (code + parameter length) plus a parameter
 // length that cannot exceed 255.
 //
+// This and WINVHCI_MAX_ACL_TRANSFER_IN bound the CONTROLLER -> HOST direction.
+// The stack's read buffers have exactly this much room, so a userspace write
+// whose event body exceeds this, or whose ACL body exceeds
+// WINVHCI_MAX_ACL_TRANSFER_IN, can never be delivered, and WinVhciDispatchWrite
+// refuses it with STATUS_INVALID_PARAMETER. It used to be admitted: handed to a
+// pended read it failed THAT request - the stack's - with
+// STATUS_BUFFER_TOO_SMALL, and parked on a backlog it was accepted and then
+// silently freed when a read arrived.
+//
 #define WINVHCI_MAX_EVENT_SIZE 257
 
 //
@@ -99,8 +111,14 @@ Environment:
 #define WINVHCI_H4_VENDOR  0xFF
 
 //
-// Largest userspace transfer: one H4 type byte plus the biggest packet body,
-// which is an ACL header plus MaxAclTransferInSize.
+// Largest userspace transfer, and the bound on the HOST -> CONTROLLER
+// direction: one H4 type byte plus the biggest packet body the stack sends,
+// which is a 4-byte ACL header plus the ACL data length the controller
+// advertised in Read_Buffer_Size - MaxAclTransferInSize, by convention. So a
+// ReadFile must offer at least WINVHCI_MAX_H4_PACKET bytes, a WriteFile may
+// carry at most that many, and a WRITE_HCI whose DataLen exceeds
+// WINVHCI_MAX_BODY is refused because no client read could ever return it.
+// The controller -> host direction is tighter; see WINVHCI_MAX_EVENT_SIZE.
 //
 #define WINVHCI_MAX_BODY      (4 + WINVHCI_MAX_ACL_TRANSFER_IN)
 #define WINVHCI_MAX_H4_PACKET (1 + WINVHCI_MAX_BODY)
@@ -332,9 +350,22 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     // during an ordinary system sleep, when the client has done nothing wrong.
     //
     BOOLEAN     RadioStarted;
+
+    //
+    // WHICH radio RadioStarted describes: the id handed out by the most recent
+    // control packet. The PDO's D0Entry and D0Exit compare their own RadioId
+    // with this and are ignored when they belong to an earlier radio. Without
+    // that, a client that closed and reopened quickly had its NEW radio's
+    // RadioStarted cleared by the OLD PDO's D0Exit - which arrives on a PnP
+    // thread some time after the close, and after the new PDO's D0Entry if the
+    // client was quick - and no D0Entry ever undid it, so every write from
+    // then on failed with STATUS_DEVICE_NOT_READY.
+    //
+    ULONG       CurrentRadioId;
     ULONG       NextRadioId;
 
-    WDFSPINLOCK Lock;               // guards every field above and below
+    WDFSPINLOCK Lock;               // guards every field above and below,
+                                    // except the two interlocked counters
 
     ULONG       BthxVersion;        // as agreed via SET_VERSION
 
@@ -354,7 +385,13 @@ typedef struct _WINVHCI_FDO_CONTEXT {
     // Counters. M1's exit criterion is observational, so make the observations
     // cheap to read back.
     //
-    ULONG       PdoRequestCount;
+    //
+    // Interlocked rather than under Lock: it is bumped on the PDO's queue
+    // callback for every request before the forward, a path with no other
+    // reason to take the FDO's lock, and a plain increment there raced the
+    // FDO-side paths on other processors.
+    //
+    volatile LONG PdoRequestCount;
     ULONG       IoctlCount;
     ULONG       WriteHciCount;
     ULONG       PendedEventReads;
@@ -432,14 +469,28 @@ WinVhciDeliverToStack(
     );
 
 //
-// Takes a queued controller-to-host packet of the given type, if one is
-// waiting. Called from the BTHX read path so a read that arrives after its
-// packet still completes immediately. Caller owns the returned packet.
+// The read half of the controller-to-host rendezvous, decided atomically.
+// Under Lock, either takes the head of the backlog for Type - returned in
+// *Taken, which the caller owns and completes the read with - or, when the
+// backlog is empty, parks Request on Queue. Returns STATUS_SUCCESS with
+// *Taken == NULL when the read was parked, and the forward's failure status
+// if it could not be.
 //
-PWINVHCI_PACKET
-WinVhciTakePendingForStack(
+// One locked region, deliberately. Checking the backlog and forwarding in two
+// separate ones left a gap in which WinVhciDeliverToStack saw an empty queue
+// and appended its packet, and the read then parked behind it: a packet and a
+// read both waiting, with nothing to bring them together until the next read
+// arrived - and BthPort keeps exactly one event read outstanding, so on that
+// channel nothing ever did. The userspace side (WinVhciEvtIoRead) has always
+// done both steps under the lock; this makes the two directions match.
+//
+NTSTATUS
+WinVhciTakeOrParkForStack(
     _In_ PWINVHCI_FDO_CONTEXT Ctx,
-    _In_ UCHAR                Type
+    _In_ UCHAR                Type,
+    _In_ WDFREQUEST           Request,
+    _In_ WDFQUEUE             Queue,
+    _Outptr_result_maybenull_ PWINVHCI_PACKET *Taken
     );
 
 //
@@ -470,11 +521,14 @@ WinVhciPurgeBacklogs(
 
 //
 // The radio's stack has stopped consuming: clear RadioStarted and drop the
-// userspace -> stack backlogs. Called from the PDO's EvtDeviceD0Exit.
+// userspace -> stack backlogs. Called from the PDO's EvtDeviceD0Exit with that
+// PDO's RadioId; ignored unless it is the current radio's, because an earlier
+// radio's shutdown arriving late must not take a newer radio down.
 //
 VOID
 WinVhciRadioStackDown(
-    _In_ PWINVHCI_FDO_CONTEXT Ctx
+    _In_ PWINVHCI_FDO_CONTEXT Ctx,
+    _In_ ULONG                RadioId
     );
 
 EVT_WDF_DEVICE_FILE_CREATE      WinVhciEvtDeviceFileCreate;

@@ -63,14 +63,24 @@ WinVhciPdoEvtD0Entry(
 {
     PWINVHCI_PDO_CONTEXT pdoCtx = WinVhciPdoGetContext(Device);
     PWINVHCI_FDO_CONTEXT ctx    = WinVhciFdoGetContext(pdoCtx->Fdo);
+    BOOLEAN              current;
 
     UNREFERENCED_PARAMETER(PreviousState);
 
+    //
+    // Only the radio the client most recently asked for gets to say that the
+    // stack is consuming. An earlier radio still being torn down can pass
+    // through D0 as well, and must not speak for the new one.
+    //
     WdfSpinLockAcquire(ctx->Lock);
-    ctx->RadioStarted = TRUE;
+    current = (BOOLEAN)(pdoCtx->RadioId == ctx->CurrentRadioId);
+    if (current) {
+        ctx->RadioStarted = TRUE;
+    }
     WdfSpinLockRelease(ctx->Lock);
 
-    KdPrint(("winvhci: pdo D0 entry\n"));
+    KdPrint(("winvhci: pdo D0 entry, radio %u%s\n",
+             pdoCtx->RadioId, current ? "" : " (not current, ignored)"));
 
     return STATUS_SUCCESS;
 }
@@ -125,10 +135,14 @@ Routine Description:
     //
     UNREFERENCED_PARAMETER(TargetState);
 
-    KdPrint(("winvhci: pdo D0 exit (target %d); the stack has stopped consuming\n",
-             TargetState));
+    KdPrint(("winvhci: pdo D0 exit, radio %u (target %d); the stack has stopped consuming\n",
+             pdoCtx->RadioId, TargetState));
 
-    WinVhciRadioStackDown(WinVhciFdoGetContext(pdoCtx->Fdo));
+    //
+    // With this PDO's id, so a late D0Exit from a radio the client has already
+    // replaced is ignored rather than taking the new radio down.
+    //
+    WinVhciRadioStackDown(WinVhciFdoGetContext(pdoCtx->Fdo), pdoCtx->RadioId);
 
     return STATUS_SUCCESS;
 }
@@ -201,7 +215,7 @@ Routine Description:
     // "BthMini never sent us anything" and "the forward across the stacks
     // failed" are distinguishable rather than both looking like silence.
     //
-    fdoCtx->PdoRequestCount++;
+    InterlockedIncrement(&fdoCtx->PdoRequestCount);
 
     WDF_REQUEST_FORWARD_OPTIONS_INIT(&options);
 

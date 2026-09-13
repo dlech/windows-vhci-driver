@@ -491,6 +491,23 @@ WinVhciBthxDispatch(
             break;
         }
 
+        //
+        // DataLen is BthMini's claim about how much follows the header. Hold
+        // it to the buffer it arrived in - the copy below reads that many
+        // bytes - and to what a client can take back: a packet longer than
+        // WINVHCI_MAX_BODY could never be returned through a ReadFile of
+        // WINVHCI_MAX_H4_PACKET bytes and would be thrown away there instead.
+        //
+        if (w->DataLen > (ULONG)InputBufferLength - (ULONG)WINVHCI_HCI_CONTEXT_HEADER_SIZE ||
+            w->DataLen > WINVHCI_MAX_BODY) {
+            KdPrint(("winvhci: WRITE_HCI DataLen %u exceeds the buffer (%u) or the limit (%u)\n",
+                     w->DataLen,
+                     (ULONG)InputBufferLength - (ULONG)WINVHCI_HCI_CONTEXT_HEADER_SIZE,
+                     WINVHCI_MAX_BODY));
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
         WdfSpinLockAcquire(ctx->Lock);
         ctx->WriteHciCount++;
         WdfSpinLockRelease(ctx->Lock);
@@ -517,13 +534,16 @@ WinVhciBthxDispatch(
 
         //
         // MEASURED layout - see WINVHCI_READ_TYPE_WORD_SIZE in winvhci.h. The
-        // context is ONE contiguous struct starting at Type3InputBuffer, and
-        // UserBuffer points at its Type field, four bytes in. An earlier build
-        // cast UserBuffer to the whole struct, so it read Data[3] as Type,
-        // saw 0x00, and rejected every read the stack posted with
-        // STATUS_NOT_SUPPORTED - which is what left nothing pended to carry
-        // HCI_Reset's Command Complete and stalled the radio at
-        // CM_PROB_FAILED_POST_START.
+        // input buffer is a bare ULONG holding the requested packet type, and
+        // UserBuffer, four bytes further on in the same allocation, is the
+        // WHOLE BTHX_HCI_READ_WRITE_CONTEXT, starting at DataLen. Two earlier
+        // readings were wrong in opposite ways: one treated the input buffer
+        // as the context and rejected every read the stack posted with
+        // STATUS_NOT_SUPPORTED, which left nothing pended to carry HCI_Reset's
+        // Command Complete and stalled the radio at CM_PROB_FAILED_POST_START;
+        // the other took UserBuffer to point at the Type field and wrote the
+        // type byte into DataLen's low byte, so the stack rejected the event
+        // and retried HCI_Reset forever.
         //
         PBTHX_HCI_READ_WRITE_CONTEXT r = (PBTHX_HCI_READ_WRITE_CONTEXT)inBuf;
         WDFQUEUE                     target;
@@ -557,8 +577,8 @@ WinVhciBthxDispatch(
         // (HciPacketAclData), and they line up perfectly with the buffer sizes
         // the stack posts:
         //
-        //     requested 4  capacity 261    -> event
-        //     requested 2  capacity 1025   -> ACL   (= 4 + MaxAclTransferInSize)
+        //     requested 4  capacity 257    -> event  (2-byte header + 255)
+        //     requested 2  capacity 1021   -> ACL    (= MaxAclTransferInSize)
         //
         // So the two-queue model was right that Type selects the channel; the
         // type is simply in the input buffer rather than the output one. See
@@ -599,14 +619,20 @@ WinVhciBthxDispatch(
                  (target == ctx->ReadDataQueue) ? "acl" : "event"));
 
         //
-        // The other half of the rendezvous: if userspace already produced a
-        // packet of this type, this read completes immediately rather than
-        // parking behind a packet that is sitting right there.
+        // The other half of the rendezvous, decided in ONE locked region: if
+        // userspace already produced a packet of this type the read completes
+        // with it now, otherwise it parks on the manual queue. The two steps
+        // used to be separate locked regions, and a packet delivered in the
+        // gap between them was queued while this read then parked behind it -
+        // with nothing to bring the two together until BthPort posted another
+        // read, which on the event channel it never does.
         //
         {
             UCHAR           wantType = (target == ctx->ReadDataQueue) ? WINVHCI_H4_ACL
                                                                      : WINVHCI_H4_EVENT;
-            PWINVHCI_PACKET queued   = WinVhciTakePendingForStack(ctx, wantType);
+            PWINVHCI_PACKET queued   = NULL;
+
+            status = WinVhciTakeOrParkForStack(ctx, wantType, Request, target, &queued);
 
             if (queued != NULL) {
                 KdPrint(("winvhci: READ_HCI satisfied from backlog, type 0x%02x %u bytes\n",
@@ -615,21 +641,12 @@ WinVhciBthxDispatch(
                 ExFreePoolWithTag(queued, WINVHCI_POOL_TAG);
                 return;
             }
-        }
 
-        status = WdfRequestForwardToIoQueue(Request, target);
-        if (!NT_SUCCESS(status)) {
-            KdPrint(("winvhci: READ_HCI forward failed 0x%08x\n", status));
-            break;
+            if (!NT_SUCCESS(status)) {
+                KdPrint(("winvhci: READ_HCI forward failed 0x%08x\n", status));
+                break;
+            }
         }
-
-        WdfSpinLockAcquire(ctx->Lock);
-        if (target == ctx->ReadDataQueue) {
-            ctx->PendedDataReads++;
-        } else {
-            ctx->PendedEventReads++;
-        }
-        WdfSpinLockRelease(ctx->Lock);
 
         KdPrint(("winvhci: READ_HCI pended (evt %u, acl %u)\n",
                  ctx->PendedEventReads, ctx->PendedDataReads));
