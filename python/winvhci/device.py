@@ -68,6 +68,13 @@ _WAIT_FAILED = 0xFFFFFFFF
 #: mechanism; it only bounds how long a reader can outlive its device.
 _READ_POLL_MS = 250
 
+#: How long a cancelled read is given to complete after ``CancelIoEx``, so the
+#: buffer it targets is never released while the kernel may still write to it.
+#: Cancellation is asynchronous: the call returns as soon as the request has
+#: been marked, and the completion - and the copy into the user buffer that
+#: comes with buffered I/O - happens afterwards.
+_CANCEL_REAP_MS = 1000
+
 #: Bound on a write. The driver never pends a write - its backlogs are
 #: unbounded and every path either completes or fails outright - so this only
 #: exists so a wedged device fails rather than hanging a test forever.
@@ -514,6 +521,11 @@ class VhciDevice:
         if self._handle is not None:
             raise VhciError('already open')
 
+        # close() sets this and nothing else clears it, so without this a
+        # device that was closed and opened again had every read return b''
+        # the moment it pended, as though it were still closing.
+        self._closing.clear()
+
         try:
             # Share mode 0. The driver is exclusive anyway
             # (WdfDeviceInitSetExclusive), so asking for sharing would only make
@@ -599,26 +611,57 @@ class VhciDevice:
 
             # Pending, which is the normal case: wait for it, in slices, so a
             # close is noticed even if CancelIoEx has not landed yet.
-            while True:
+            #
+            # close() may run on another thread at any point in here, and it
+            # closes the file and event handles as soon as it has issued its
+            # own CancelIoEx. Any Win32 failure after that is the close being
+            # seen from this side, not a fault - so once _closing is set, an
+            # OSError means "the device went away" and the read ends quietly.
+            try:
+                while True:
+                    if self._closing.is_set():
+                        self._api.CancelIoEx(
+                            hFile=handle,
+                            lpOverlapped=ctypes.byref(self._read_ov))
+                        self._reap_cancelled_read(handle, event)
+                        return b''
+                    if self._api.WaitForSingleObject(
+                            hHandle=event,
+                            dwMilliseconds=_READ_POLL_MS) == _WAIT_OBJECT_0:
+                        break
+            except OSError as error:
                 if self._closing.is_set():
-                    self._api.CancelIoEx(
-                        hFile=handle,
-                        lpOverlapped=ctypes.byref(self._read_ov))
                     return b''
-                if self._api.WaitForSingleObject(
-                        hHandle=event,
-                        dwMilliseconds=_READ_POLL_MS) == _WAIT_OBJECT_0:
-                    break
+                raise VhciError(f'waiting for ReadFile failed: {error}') from error
 
         try:
             transferred = self._api.GetOverlappedResult(
                 hFile=handle, lpOverlapped=ctypes.byref(self._read_ov))
         except OSError as error:
-            if error.winerror == _ERROR_OPERATION_ABORTED:
+            if error.winerror == _ERROR_OPERATION_ABORTED or self._closing.is_set():
                 return b''
             raise VhciError(f'GetOverlappedResult failed: {error}') from error
 
         return bytes(buffer[:transferred])
+
+    def _reap_cancelled_read(self, handle: int, event: int) -> None:
+        """Wait, briefly, for a cancelled read to actually complete.
+
+        The read's buffer is a local in :meth:`read`. With buffered I/O the
+        kernel copies the result into it at completion time, and cancellation
+        only marks the request - completion follows on its own schedule. So
+        returning the moment CancelIoEx comes back would release a buffer the
+        kernel may still be about to write into. A bounded wait plus one
+        GetOverlappedResult collects the request first; the result itself is
+        irrelevant, and failures are expected here (ERROR_OPERATION_ABORTED,
+        or the handle already closed by close()).
+        """
+        try:
+            self._api.WaitForSingleObject(hHandle=event, dwMilliseconds=_CANCEL_REAP_MS)
+            self._api.GetOverlappedResult(
+                hFile=handle, lpOverlapped=ctypes.byref(self._read_ov))
+        except OSError:
+            pass
 
     def write(self, data: bytes) -> None:
         """Write one H4 packet."""
