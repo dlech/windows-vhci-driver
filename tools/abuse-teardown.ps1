@@ -57,8 +57,10 @@ $failures = 0
 for ($i = 1; $i -le $Rounds; $i++) {
     Write-Host "=== round $i/$Rounds ===" -ForegroundColor Cyan
 
+    # Paths are quoted by hand: Start-Process joins -ArgumentList with spaces
+    # and quotes nothing, so a tools directory with a space in its name split.
     $p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
-        '-ExecutionPolicy','Bypass','-File',$Bridge,
+        '-ExecutionPolicy','Bypass','-File',"`"$Bridge`"",
         '-RemoteHost',$RemoteHost,'-Port',$Port
     ) -RedirectStandardOutput "C:\abuse-$i.log" -RedirectStandardError "C:\abuse-$i.err"
 
@@ -112,7 +114,7 @@ Write-Host '=== kill the client with ACL in flight ===' -ForegroundColor Cyan
 #
 if (Test-Path $Connect) {
     $p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
-        '-ExecutionPolicy','Bypass','-File',$Bridge,
+        '-ExecutionPolicy','Bypass','-File',"`"$Bridge`"",
         '-RemoteHost',$RemoteHost,'-Port',$Port
     ) -RedirectStandardOutput 'C:\abuse-acl.log' -RedirectStandardError 'C:\abuse-acl.err'
 
@@ -136,7 +138,7 @@ if (Test-Path $Connect) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     } else {
         $gatt = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
-            '-ExecutionPolicy','Bypass','-File',$Connect
+            '-ExecutionPolicy','Bypass','-File',"`"$Connect`""
         ) -RedirectStandardOutput 'C:\abuse-gatt.log' -RedirectStandardError 'C:\abuse-gatt.err'
 
         # Long enough to be inside service discovery / a characteristic read.
@@ -175,7 +177,7 @@ Write-Host '=== device restart with a client attached ===' -ForegroundColor Cyan
 # assumed after a fixed sleep.
 $ctlSec = $SettleSec + $TeardownSec + 30
 $p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
-    '-ExecutionPolicy','Bypass','-File',$Ctl,'-Seconds',$ctlSec
+    '-ExecutionPolicy','Bypass','-File',"`"$Ctl`"",'-Seconds',$ctlSec
 ) -RedirectStandardOutput 'C:\abuse-dis.log' -RedirectStandardError 'C:\abuse-dis.err'
 
 $deadline = (Get-Date).AddSeconds($SettleSec)

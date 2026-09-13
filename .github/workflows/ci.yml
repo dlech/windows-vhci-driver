@@ -215,9 +215,13 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path diag -Force | Out-Null
           Copy-Item "$env:windir\INF\setupapi.dev.log" diag\ -ErrorAction SilentlyContinue
-          bcdedit /enum '{current}'          > diag\bcdedit.txt        2>&1
-          pnputil /enum-drivers              > diag\enum-drivers.txt   2>&1
-          pnputil /enum-devices /problem     > diag\problem-devices.txt 2>&1
+          # No 2>&1 on native commands: this is Windows PowerShell 5.1 with
+          # ErrorActionPreference Stop (GitHub sets it), where redirecting a
+          # native command's stderr is a terminating error as soon as it writes
+          # a line there - and this step must not fail on the way to the upload.
+          bcdedit /enum '{current}'          > diag\bcdedit.txt
+          pnputil /enum-drivers              > diag\enum-drivers.txt
+          pnputil /enum-devices /problem     > diag\problem-devices.txt
           Get-PnpDevice | Format-List * | Out-File diag\pnp-all.txt
           Get-WinEvent -LogName System -MaxEvents 200 -ErrorAction SilentlyContinue |
             Format-List TimeCreated, Id, ProviderName, Message | Out-File diag\system-events.txt
@@ -229,7 +233,7 @@ jobs:
           # abuse-teardown.ps1 writes a per-round bridge log to the root of C:.
           Copy-Item C:\abuse-*.log diag\ -ErrorAction SilentlyContinue
           Copy-Item C:\abuse-*.err diag\ -ErrorAction SilentlyContinue
-          verifier /query > diag\verifier-query.txt 2>&1
+          verifier /query > diag\verifier-query.txt
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -375,7 +379,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path diag -Force | Out-Null
           Copy-Item "$env:windir\INF\setupapi.dev.log" diag\ -ErrorAction SilentlyContinue
-          pnputil /enum-devices /problem > diag\problem-devices.txt 2>&1
+          pnputil /enum-devices /problem > diag\problem-devices.txt
           Get-PnpDevice | Format-List * | Out-File diag\pnp-all.txt
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

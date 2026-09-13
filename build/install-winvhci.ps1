@@ -141,7 +141,11 @@ function Remove-VhciDriverStoreEntries {
         }
     } | Sort-Object -Unique | ForEach-Object {
         Write-Host "  removing driver store entry $_"
-        pnputil /delete-driver $_ /uninstall /force 2>&1 | Out-Null
+        # No 2>&1: under Windows PowerShell 5.1 with ErrorActionPreference
+        # Stop, redirecting a native command's stderr is a terminating error
+        # the moment it writes anything there. Its stderr reaches the console
+        # regardless.
+        pnputil /delete-driver $_ /uninstall /force | Out-Null
     }
 }
 
@@ -328,7 +332,10 @@ Write-Step 'Installing the driver package'
 # An untrusted or expired signer makes pnputil HANG rather than fail, so this
 # gets a hard timeout instead of an unbounded wait.
 $log = Join-Path $env:TEMP 'winvhci-pnputil.log'
-$proc = Start-Process pnputil.exe -ArgumentList @('/add-driver', $inf, '/install') `
+# The path is quoted by hand. Start-Process joins -ArgumentList with spaces and
+# quotes nothing, so a package unpacked under "C:\Users\First Last\..." arrived
+# at pnputil as two arguments and the install failed.
+$proc = Start-Process pnputil.exe -ArgumentList @('/add-driver', "`"$inf`"", '/install') `
             -NoNewWindow -PassThru -RedirectStandardOutput $log
 
 # Reading .Handle is not redundant: Start-Process -PassThru returns a Process

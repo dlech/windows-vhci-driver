@@ -35,7 +35,14 @@ CAPTURE=0
 BUILD=1
 while [ $# -gt 0 ]; do
     case "$1" in
-        --capture)  CAPTURE="${2:-20}"; shift 2 ;;
+        --capture)
+            # The count is optional. Take $2 only when it is a number, so a
+            # bare "--capture" and "--capture --no-build" both work; the old
+            # "shift 2" died on the first and swallowed the option in the second.
+            case "${2:-}" in
+                ''|*[!0-9]*) CAPTURE=20;   shift   ;;
+                *)           CAPTURE="$2"; shift 2 ;;
+            esac ;;
         --no-build) BUILD=0; shift ;;
         *)          echo "unknown option: $1" >&2; exit 2 ;;
     esac

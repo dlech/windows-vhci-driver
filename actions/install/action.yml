@@ -188,6 +188,12 @@ runs:
 
         $query = Join-Path $env:GITHUB_ACTION_PATH 'query-device.ps1'
         $json = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $query
+        # A query that threw - a hardware-ID mismatch, say - produced no JSON,
+        # and used to be reported as "no device is present", which points at
+        # the wrong thing entirely. Its own error is on stderr above.
+        if ($LASTEXITCODE -ne 0) {
+          throw "query-device.ps1 exited $LASTEXITCODE; see its error above"
+        }
         if (-not $json) { throw 'no winvhci device is present after install' }
 
         $fdo = $json | ConvertFrom-Json

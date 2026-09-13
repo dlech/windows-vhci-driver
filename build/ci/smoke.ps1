@@ -44,7 +44,15 @@ param(
     # early the handle closes, the radio vanishes, and every remaining check
     # fails for a reason that has nothing to do with the driver. A single
     # FindAllAsync scan can take 90 seconds on its own.
-    [int]   $BumbleSec  = 600
+    [int]   $BumbleSec  = 600,
+
+    # Tier 2 also floods this many unsolicited advertising reports at the
+    # settled stack and then asserts that every one reached the driver and
+    # that the userspace -> stack backlogs are empty afterwards. That is the
+    # detector for the READ_HCI rendezvous race: a packet queued while the
+    # read it should have met parked behind it leaves a depth that never
+    # drains. Zero disables the flood and the two checks.
+    [int]   $FloodPackets = 10000
 )
 
 $ErrorActionPreference = 'Stop'
@@ -153,7 +161,10 @@ Write-Host '=== Installing ===' -ForegroundColor Cyan
 # An untrusted or expired signer makes pnputil HANG rather than fail - msquic
 # hit exactly this on a hosted runner and it cost them a support issue - so it
 # gets a hard timeout rather than an unbounded wait.
-$p = Start-Process pnputil.exe -ArgumentList @('/add-driver', $inf, '/install') `
+# Paths handed to Start-Process are quoted by hand throughout this script:
+# -ArgumentList is joined with spaces and nothing is quoted for you, so a
+# checkout under a directory with a space in its name split every path in two.
+$p = Start-Process pnputil.exe -ArgumentList @('/add-driver', "`"$inf`"", '/install') `
         -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\pnputil.log"
 
 # Reading .Handle here is not redundant. Start-Process -PassThru hands back a
@@ -227,7 +238,11 @@ if ($Verifier) {
     # When this script runs on a machine where Verifier IS armed - a developer
     # guest that has rebooted with /standard set - the same abuse then runs
     # under real verification, which is the combination that matters.
-    $query = verifier /query 2>&1 | Out-String
+    # No 2>&1 on native commands anywhere in this script: under Windows
+    # PowerShell 5.1 with ErrorActionPreference Stop it turns the first line a
+    # tool writes to stderr into a terminating error, and here that would end
+    # the run before the summary and the JSON are written.
+    $query = verifier /query | Out-String
     if ($query -match '(?i)winvhci') {
         Write-Host '  Verifier is verifying winvhci.sys - the abuse tier will run under it' -ForegroundColor Green
     } else {
@@ -244,7 +259,7 @@ Write-Host '=== The radio, while a client holds the handle ===' -ForegroundColor
 # the right scope for a load smoke test.
 $ctl = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList @(
     '-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-File', (Join-Path $ToolsDir 'vhcictl.ps1'),
+    '-File', "`"$(Join-Path $ToolsDir 'vhcictl.ps1')`"",
     '-Seconds', "$SettleSec"
 )
 Write-Host "  started vhcictl (pid $($ctl.Id)) for ${SettleSec}s"
@@ -316,12 +331,39 @@ if ($Bumble) {
     $bumbleOut = Join-Path (Get-Location) 'bumble.out.log'
     $bumbleErr = Join-Path (Get-Location) 'bumble.err.log'
 
+    $bridgeLog = Join-Path (Get-Location) 'bumble.bridge.log'
+
+    # --flood-after 10: ten seconds after the stack's first HCI command, which
+    # lands on a settled stack with a read pended - the regime the detector
+    # below is about. See flood() in bumble-controller.py for the two regimes.
+    $controllerArgs = @("`"$(Join-Path $ToolsDir 'bumble-controller.py')`"",
+                        '--peer', '--dual-mode', '--host', '127.0.0.1', '--port', "$BumblePort")
+    if ($FloodPackets -gt 0) {
+        $controllerArgs += @('--flood', "$FloodPackets", '--flood-after', '10')
+    }
     $controller = Start-Process $Python -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $bumbleOut -RedirectStandardError $bumbleErr `
-        -ArgumentList @((Join-Path $ToolsDir 'bumble-controller.py'),
-                        '--peer', '--dual-mode', '--host', '127.0.0.1', '--port', "$BumblePort")
+        -ArgumentList $controllerArgs
     $null = $controller.Handle
     $bridge = $null
+
+    # The bridge prints the driver's counters every -Stats seconds, and it is
+    # the only process that can: the device is exclusive. This parses the most
+    # recent block out of its log.
+    function Get-BridgeStats {
+        $lines  = @(Get-Content $bridgeLog -ErrorAction SilentlyContinue)
+        $totals = @($lines | Where-Object { $_ -match 'user->stack (\d+)\s+stack->user (\d+)' })
+        $depths = @($lines | Where-Object { $_ -match 'events depth (\d+) peak (\d+)\s+acl depth (\d+) peak (\d+)' })
+        if (-not $totals -or -not $depths) { return $null }
+        $null = $totals[-1] -match 'user->stack (\d+)\s+stack->user (\d+)'
+        $writesTotal = [int]$Matches[1]
+        $null = $depths[-1] -match 'events depth (\d+) peak (\d+)\s+acl depth (\d+) peak (\d+)'
+        [pscustomobject]@{
+            WritesTotal = $writesTotal
+            EventDepth  = [int]$Matches[1]; EventPeak = [int]$Matches[2]
+            AclDepth    = [int]$Matches[3]; AclPeak   = [int]$Matches[4]
+        }
+    }
 
     try {
         # Wait on the log line, not on a TCP connect. Bumble's tcp-server
@@ -334,10 +376,12 @@ if ($Bumble) {
             } 60
         } "see bumble.out.log / bumble.err.log"
 
-        $bridge = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList @(
+        $bridge = Start-Process powershell.exe -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $bridgeLog -ArgumentList @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass',
-            '-File', (Join-Path $ToolsDir 'vhcibridge.ps1'),
-            '-RemoteHost', '127.0.0.1', '-Port', "$BumblePort", '-Seconds', "$BumbleSec"
+            '-File', "`"$(Join-Path $ToolsDir 'vhcibridge.ps1')`"",
+            '-RemoteHost', '127.0.0.1', '-Port', "$BumblePort", '-Seconds', "$BumbleSec",
+            '-Stats', '2'
         )
         $null = $bridge.Handle
         Write-Host "  bridge started (pid $($bridge.Id))"
@@ -425,6 +469,38 @@ if ($Bumble) {
             }
             return $false
         } 'the peer advertises from a random address; --peer-address-type public stops discovery working'
+
+        if ($FloodPackets -gt 0) {
+            # RENDEZVOUS DETECTOR. bumble-controller.py has by now flooded
+            # $FloodPackets unsolicited advertising reports at the settled
+            # stack. Two things must be true afterwards: every report reached
+            # the driver, and the userspace -> stack backlogs are EMPTY.
+            #
+            # The driver once decided a READ_HCI's rendezvous in two locked
+            # steps. A write landing between them was queued while the read
+            # then parked behind it, and on the event channel - BthPort keeps
+            # exactly one read outstanding - nothing ever drained it again. A
+            # non-zero depth on a settled stack is that stall, so this is a
+            # detector for the race and not only a regression guard.
+            $flooded = Wait-For "the bridge to report at least $FloodPackets writes" {
+                $s = Get-BridgeStats
+                $s -and $s.WritesTotal -ge $FloodPackets
+            } 120
+            Check "every one of the $FloodPackets flooded reports reached the driver" { $flooded } `
+                  'see bumble.bridge.log (the driver counters) and bumble.out.log (the flood)'
+
+            if ($flooded) {
+                # Two more stats periods, so the depth read is from after the
+                # last write went in.
+                Start-Sleep -Seconds 5
+                $s = Get-BridgeStats
+                Write-Host ("    after the flood: writes {0}, event depth {1} (peak {2}), acl depth {3} (peak {4})" -f `
+                            $s.WritesTotal, $s.EventDepth, $s.EventPeak, $s.AclDepth, $s.AclPeak)
+                Check 'the userspace->stack backlogs drained to zero' {
+                    $s.EventDepth -eq 0 -and $s.AclDepth -eq 0
+                } 'a packet left on the backlog with a read parked behind it is the rendezvous race'
+            }
+        }
     }
     finally {
         foreach ($proc in $bridge, $controller) {
@@ -452,7 +528,7 @@ if ($Verifier -and $Bumble) {
     $controller = Start-Process $Python -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path (Get-Location) 'bumble.abuse.log') `
         -RedirectStandardError  (Join-Path (Get-Location) 'bumble.abuse.err.log') `
-        -ArgumentList @((Join-Path $ToolsDir 'bumble-controller.py'),
+        -ArgumentList @("`"$(Join-Path $ToolsDir 'bumble-controller.py')`"",
                         '--peer', '--dual-mode', '--host', '127.0.0.1', '--port', "$BumblePort")
     $null = $controller.Handle
     try {
@@ -483,7 +559,7 @@ if ($Verifier -and $Bumble) {
     # where nothing was allocated proves nothing about pool handling.
     Write-Host ''
     Write-Host '--- verifier /query ---' -ForegroundColor DarkGray
-    verifier /query 2>&1 | ForEach-Object { Write-Host "  $_" }
+    verifier /query | ForEach-Object { Write-Host "  $_" }
 }
 
 Write-Host ''
@@ -510,7 +586,7 @@ pnputil /enum-drivers | ForEach-Object {
     elseif ($_ -match '^\s*Original Name:\s*winvhci\.inf' -and $published) { $published; $published = $null }
 } | Sort-Object -Unique | ForEach-Object {
     Write-Host "  removing driver store entry $_"
-    pnputil /delete-driver $_ /uninstall /force 2>&1 | Out-Null
+    pnputil /delete-driver $_ /uninstall /force | Out-Null
 }
 
 Check 'nothing winvhci remains' { -not (Get-Fdo) -and -not (Get-Radio) }
@@ -524,7 +600,7 @@ if ($Verifier) {
     # driver enrolled: nothing below reboots, so leaving verification armed for
     # a driver that has just been uninstalled would be a trap for whatever runs
     # next.
-    verifier /volatile /removedriver winvhci.sys 2>&1 | ForEach-Object { Write-Host "  $_" }
+    verifier /volatile /removedriver winvhci.sys | ForEach-Object { Write-Host "  $_" }
 }
 
 Write-Host ''

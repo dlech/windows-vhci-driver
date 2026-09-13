@@ -54,7 +54,9 @@ Copy-Item $devcon    $Staging -Force
 $inf = Join-Path $Staging 'winvhci.inf'
 
 Write-Host '== Removing any previous instance ==' -ForegroundColor Cyan
-& "$Staging\devcon.exe" remove "root\winvhci" 2>&1 | Out-Null
+# No 2>&1 on native commands: under Windows PowerShell 5.1 with
+# ErrorActionPreference Stop that makes anything on stderr a terminating error.
+& "$Staging\devcon.exe" remove "root\winvhci" | Out-Null
 
 # Purge every existing winvhci package from the driver store.
 #
@@ -79,7 +81,7 @@ pnputil /enum-drivers | ForEach-Object {
     }
 } | Sort-Object -Unique | ForEach-Object {
     Write-Host "  removing driver store entry $_"
-    pnputil /delete-driver $_ /uninstall /force 2>&1 | Out-Null
+    pnputil /delete-driver $_ /uninstall /force | Out-Null
 }
 
 Write-Host '== Installing driver package ==' -ForegroundColor Cyan

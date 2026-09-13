@@ -66,6 +66,11 @@ $machineArch = try {
 } catch { $env:PROCESSOR_ARCHITECTURE }
 Note machine.arch        $machineArch
 Note process.arch        $env:PROCESSOR_ARCHITECTURE
+# The Windows Kits tree names its directories x64, not AMD64, so the CPU name
+# has to be mapped before it can pick a copy of a tool. Matching on AMD64 never
+# hit, and the fallback sort then ranked the x86 copy first - exactly the
+# stale-32-bit pick the ranking exists to avoid.
+$kitArch = if ($machineArch -eq 'AMD64') { 'x64' } else { $machineArch }
 # The WinRT checks below only work under Windows PowerShell 5.1 - PowerShell 7
 # dropped the WindowsRuntime type accelerator - so record which host this is.
 Note host.psversion      $PSVersionTable.PSVersion.ToString()
@@ -246,7 +251,7 @@ foreach ($tool in 'devgen.exe','devcon.exe','stampinf.exe','inf2cat.exe','signto
         $hits = @(Get-ChildItem $p -Recurse -Filter $tool -File -ErrorAction SilentlyContinue)
         if (-not $hits) { return '<absent>' }
         $ranked = $hits | Sort-Object `
-            @{ Expression = { $_.FullName -match "\\$machineArch\\" }; Descending = $true },
+            @{ Expression = { $_.FullName -match "\\$kitArch\\" }; Descending = $true },
             @{ Expression = { $_.FullName }; Descending = $true }
         "$($ranked[0].FullName)   (of $($hits.Count) copies)"
     }

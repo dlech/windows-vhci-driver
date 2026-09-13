@@ -233,7 +233,10 @@ Step 'Staging the artifact'
 
 # One directory, so actions/upload-artifact@v4 reproduces a known tree - it
 # roots the archive at the common ancestor of whatever paths it is given.
-$stage = Join-Path $repo $OutDir
+# Join-Path with a rooted second argument yields nonsense ("C:\repo\D:\out"), so
+# an absolute -OutDir is used as given and only a relative one is anchored to
+# the repository.
+$stage = if ([IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repo $OutDir }
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path (Join-Path $stage 'package') -Force | Out-Null
 Copy-Item "$pkg\winvhci.sys", "$pkg\winvhci.inf", "$pkg\winvhci.cat" (Join-Path $stage 'package')
