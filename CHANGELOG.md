@@ -24,6 +24,60 @@ the supported runner images.
   is not Bluetooth-tested in CI, because GitHub offers no Windows 11 x64 client
   runner.
 - The smoke and consumer-action jobs run on ARM64 only, for the same reason.
+- The release workflow follows the same policy: x64 packages are installed and
+  uninstalled on `windows-2025` but not Bluetooth-tested, the ARM64 package is
+  driven by Bumble on a Windows 11 client runner, and it is the **Release**
+  build users download that gets installed, not the Debug one. The release
+  notes say so instead of listing Server as a supported runner.
+
+### Fixed
+
+- **Driver:** a `READ_HCI` that arrived while a packet was being written could
+  park behind that packet, leaving both waiting with nothing to bring them
+  together; on the event channel, where BthPort keeps a single read
+  outstanding, that stalled the radio until the stack gave up. The check and
+  the park now happen under one lock, as they always did on the userspace side.
+- **Driver:** a packet larger than the stack can receive (an event body over
+  257 bytes, an ACL body over 1021 including its header) is refused at the
+  write with `STATUS_INVALID_PARAMETER`. It used to be accepted and then either
+  failed the stack's read with `STATUS_BUFFER_TOO_SMALL` or was queued and
+  silently thrown away. `WRITE_HCI` likewise refuses a `DataLen` that exceeds
+  its buffer or the largest packet a client can read.
+- **Driver:** closing the device and reopening it quickly could leave the new
+  radio permanently refusing writes: the old radio's shutdown notification,
+  which arrives later on a PnP thread, cleared the started state of whichever
+  radio was current. Start and stop now apply only to the radio they belong to.
+- `VhciDevice` can be closed and opened again; every read on a reopened device
+  used to return empty at once. Closing it from another thread while a read is
+  blocked now ends that read quietly, as documented, instead of raising.
+- `winvhci.bumble_compat` returns proper return parameters for commands the
+  installed Bumble models as synchronous, so Bumble 0.0.234 no longer logs an
+  ERROR on every `LE_Set_Data_Length` while the reply was in fact correct.
+- `vhci-io.ps1` pins the read buffer for as long as the overlapped read is
+  outstanding; a garbage-collection pass in between could move it and have the
+  kernel write the packet over another object. A read or write that completed
+  in the gap between its timeout and the cancel is reported as completed
+  rather than lost, and the stats size-mismatch message can now actually
+  appear.
+- `install-winvhci.ps1` and `smoke.ps1` quote the paths they hand to
+  `Start-Process`, so a package unpacked under a directory with a space in its
+  name installs.
+- `test-write-gating.ps1` waits for the radio to start rather than merely to
+  be enumerated, so a slow bring-up no longer fails four asserts spuriously,
+  and it checks oversized packets, the stats size contract and a back-to-back
+  reopen. `abuse-teardown.ps1`'s ACL round ran only when the tools lived in
+  `C:\tools` and passed even when no radio ever came up; it now finds
+  `win-ble-connect.ps1` beside the bridge and fails when there was nothing to
+  tear down. `test-radio-toggle.ps1` prints its result after a vanished radio
+  instead of crashing on the next cycle. `vhcibridge.ps1` names an over-long
+  frame instead of failing on the raw write and survives a write refused while
+  the radio is off.
+- Native commands under Windows PowerShell 5.1 are no longer run with `2>&1`,
+  which is a terminating error there the moment the command writes to stderr;
+  `smoke.ps1` in particular could abort before writing its summary.
+- `deploy-driver.sh --capture` without a value no longer aborts the script;
+  `probe-runner.ps1` prefers the x64 kit tools on an x64 machine instead of the
+  x86 copies; `build-package.ps1` accepts an absolute `-OutDir`.
 
 ## [1.2.1] - 2026-09-07
 

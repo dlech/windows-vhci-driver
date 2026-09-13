@@ -79,12 +79,27 @@ Both directions follow one rule, and it is the invariant the whole driver rests 
 (request queue, packet list)
   (empty,  *)      → append packet to list
   (!empty, empty)  → dequeue request, complete it with the packet
-  (!empty, !empty) → impossible; assert
+  (!empty, !empty) → impossible
 ```
 
-Backlogs are bounded at `WINVHCI_MAX_BACKLOG` (64). On overflow the driver drops and counts —
-a virtual controller that blocks the host stack is worse than one that loses a packet, and the
-counter records that it happened.
+"Impossible" holds only because **both halves of each rendezvous decide under the one FDO
+lock**: a read checks its backlog and parks itself in one locked region, and a packet checks for
+a parked read and queues itself in another. The stack-facing read path once split its two steps
+across separate locked regions, and a packet arriving in the gap was queued while the read then
+parked behind it — the third state, with nothing to bring the two together until BthPort posted
+another read, which on the event channel it never does (it keeps exactly one outstanding).
+`WinVhciTakeOrParkForStack` is the single locked step that closes that gap; `WinVhciEvtIoRead`
+has always been one on the userspace side.
+
+Backlogs are **unbounded and never drop** while there is somewhere to deliver — the same policy
+as Linux's `/dev/vhci`, whose `hdev->rx_q` and `data->readq` have no capacity check either. What
+makes that safe is admission: a write is refused up front with `STATUS_DEVICE_NOT_READY` when no
+radio exists or its stack has stopped consuming (Linux's `-ENODEV` and `-ENXIO`), and with
+`STATUS_INVALID_PARAMETER` when the packet could never be delivered — an event body over 257
+bytes or an ACL body over 1021 (`MaxAclTransferInSize`, header included), which is exactly the
+room the stack's read buffers have. Two earlier designs, a bound of 64 with a silent drop and
+then the same bound with backpressure, are recorded and rejected in `winvhci.h`, "Backlog
+policy".
 
 Observed during bring-up: the stack posts **one** event read and **two** ACL reads, and
 replenishes a read as soon as one is completed.
@@ -229,13 +244,26 @@ Mechanics:
   `WINVHCI_MAX_H4_PACKET` = 1 type byte + 4-byte ACL header + 1021.
 - `WdfDeviceInitSetExclusive(TRUE)` — one controller at a time, mirroring vhci's `open_mutex`.
 - `EvtDeviceFileCreate` / `EvtFileClose` own the radio lifetime: close tears down the PDO,
-  purges both directions, and completes outstanding BTHX reads.
+  purges both directions, and completes outstanding BTHX reads. Each control packet stamps a
+  new radio id, and a PDO's `D0Entry` / `D0Exit` only count for the *current* id — so a radio
+  torn down after a quick close-and-reopen cannot clear its successor's started state when its
+  own `D0Exit` finally arrives on a PnP thread.
+- Controller → host packets are bounded by the stack's read buffers, 257 bytes for an event
+  and 1021 for ACL including the 4-byte header, and a write over its type's limit is refused
+  with `STATUS_INVALID_PARAMETER`. A larger packet could only ever fail the stack's read.
 - Clients open with `FILE_FLAG_OVERLAPPED`. This is not optional in practice: a synchronous
   `ReadFile` blocks indefinitely once the stack goes quiet, so a bounded run never terminates
   and has to be killed — which also loses its buffered output.
 
-There is no statistics IOCTL. Counters live in the FDO context and reach the outside world
-through `KdPrint`, read with DebugView — see [development.md](development.md).
+`IOCTL_WINVHCI_GET_STATS` (`METHOD_BUFFERED`, `FILE_READ_ACCESS`) returns a `WINVHCI_STATS`
+snapshot taken under the FDO lock: drops split by cause, the depth and peak of every backlog,
+totals in each direction, writes refused for want of a radio, and the number of radio PDOs still
+alive. `VhciDevice.stats()` and `vhcibridge.ps1 -Stats` read it and `tools/test-write-gating.ps1`
+asserts on it. A buffer shorter than the struct is refused outright with
+`STATUS_BUFFER_TOO_SMALL`; a client built against an older header sees
+`ERROR_INSUFFICIENT_BUFFER` and nothing more, because Win32 reports zero bytes returned for an
+error status, and the driver's `sizeof` travels in `Size` so a mismatch the other way is
+detectable too. `KdPrint` remains the transcript — see [development.md](development.md).
 
 ---
 

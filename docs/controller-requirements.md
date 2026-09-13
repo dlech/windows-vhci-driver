@@ -40,6 +40,13 @@ parameter-returning commands need individual handling.
 Two values must agree with what the driver told BthPort in `QUERY_CAPABILITIES`: the ACL packet
 length in `Read_Buffer_Size` (1021) and anything derived from it.
 
+The driver also enforces the other direction's ceiling. The stack's read buffers hold exactly
+257 bytes of event (a 2-byte header plus 255 parameter bytes) and 1021 bytes of ACL *including*
+the 4-byte header, so a controller → host write larger than that is refused with
+`STATUS_INVALID_PARAMETER` (`ERROR_INVALID_PARAMETER` in Win32) rather than accepted and then
+failed against the stack's read. Windows sets the ACL bound itself through `Host_Buffer_Size`;
+a controller that honours it never sees the refusal.
+
 **A single refusal restarts everything.** One `Unknown HCI Command` reply makes the stack begin
 its whole sequence again, indefinitely. During bring-up this looks like a hang or a lost packet;
 it is neither. The loop stops as soon as every command in the sequence is answered plausibly.
@@ -155,7 +162,7 @@ WARNING bumble.controller: !!! no connection for 00:00:00:00:00:00
 
 The controller already records the right answer: each `Connection` carries a `self_address`,
 the address that connection was actually established with. `WindowsCompatLink` in
-`tools/bumble-controller.py` uses it, and everything works.
+`python/winvhci/bumble_compat.py` uses it, and everything works.
 
 **A related trap:** advertising the peer with `own_address_type=PUBLIC` looks more correct —
 `aa:bb:cc:dd:ee:ff` is not a well-formed random static address — but it stops Windows
@@ -164,8 +171,9 @@ discovering the peer at all. Bumble's simulated link wants `RANDOM`, which is it
 
 ## The Bumble shim
 
-`tools/bumble-controller.py` defines `WindowsCompatController`, which is Bumble's `Controller`
-plus exactly what the above requires:
+`python/winvhci/bumble_compat.py` defines `WindowsCompatController` — which
+`tools/bumble-controller.py` imports, along with any consumer's own test suite — as Bumble's
+`Controller` plus exactly what the above requires:
 
 - 14 BR/EDR configuration handlers Bumble does not implement (`Write_Authentication_Enable`
   first, then page/inquiry/scan/name/voice settings). Every one of these command classes
