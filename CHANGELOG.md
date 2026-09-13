@@ -12,6 +12,8 @@ the supported runner images.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-13
+
 ### Changed
 
 - **Windows Server runners are no longer supported.** Use a Windows client
@@ -183,7 +185,8 @@ First release.
 - Driver Verifier cannot be armed on a hosted runner, so the teardown abuse
   suite runs under it only on a developer machine.
 
-[Unreleased]: https://github.com/dlech/windows-vhci-driver/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/dlech/windows-vhci-driver/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/dlech/windows-vhci-driver/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/dlech/windows-vhci-driver/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/dlech/windows-vhci-driver/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/dlech/windows-vhci-driver/compare/v1.1.0...v1.1.1
