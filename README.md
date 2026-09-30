@@ -149,6 +149,43 @@ removes everything it added. By default only SYSTEM and Administrators may open 
 since whoever holds it can inject arbitrary HCI into the local Bluetooth stack;
 `-AllowInteractiveUsers` relaxes that for a development machine.
 
+### A Windows bug you will hit: the Device Association Service hang
+
+On the supported runners, about one connect in a hundred hangs for 38.5 seconds and then
+fails, in one of two forms:
+
+- `BluetoothLEDevice.FromBluetoothAddressAsync` returns `E_FAIL` (`0x80004005`;
+  `[WinError -2147467259]` from pywinrt), or
+- `DeviceInformation.FindAllAsync` with a GATT or connected-device selector returns `E_ABORT`
+  (`0x80004004`; `[WinError -2147467260]`),
+
+and the System event log records event 3503 from `Microsoft-Windows-DeviceAssociationService`,
+"endpoint discovery failure", at that moment. A test run with sixteen connects sees it in
+roughly one job in seven. Seen on `windows-11-vs2026-arm` at OS builds 26200.9445 and
+26200.9457 (`das.dll` 10.0.26100.9444).
+
+It is not the driver, and it is not the controller. In `das.dll`, `OnQueryStateUpdateStub`
+publishes a query-state work item onto a lock-free list *before* writing the item's sequence
+number; the consumer applies updates strictly in order, so when it reads the unwritten
+sequence it sleeps `100 * n^2` ms for eleven rounds (38.5 s) and abandons the query. During
+the hang the HCI trace is idle and the driver has dropped nothing; ETW shows the query created
+and never dispatched; minidumps of the service show the waiting thread with a garbage sequence
+number. It reproduces on a QEMU guest with the same build, and Microsoft's feature-flagged
+fixes on that path (`bugfix_60814245` and neighbours) do not remove it. The same DLL contains a
+rewritten hand-off that avoids the race, gated behind a future-release feature, so it should
+go away with a later Windows update.
+
+Until then, retry those two errors and only those. With pytest:
+
+```
+pytest --reruns=2 --only-rerun=-2147467259 --only-rerun=-2147467260
+```
+
+(`pytest-rerunfailures`; the values are regular expressions matched against the failure
+text). bleak does this in [hbldh/bleak#2038](https://github.com/hbldh/bleak/pull/2038). Do
+not spend time looking for it in your controller: a week of HCI traces, driver counters and
+service dumps went into establishing the above.
+
 ## Documentation
 
 - [docs/research.md](docs/research.md) — how the Windows Bluetooth stack is put together, where
