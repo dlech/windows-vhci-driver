@@ -125,7 +125,7 @@ jobs:
             -WdkVersion $env:WDK_VERSION `
             -OutDir out
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: winvhci-${{ matrix.platform }}-${{ matrix.configuration }}
           path: out/
@@ -134,7 +134,7 @@ jobs:
       # The binlog is the only practical way to see which of the WDK's
       # Exists()-guarded imports actually resolved, which is the failure mode
       # most likely to bite when the toolchain moves.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: buildlog-${{ matrix.platform }}-${{ matrix.configuration }}
@@ -169,7 +169,7 @@ jobs:
       # whether that changed anything here. It does not, for an artifact this
       # repo's own upload-artifact step produced - "driver package is present"
       # passes on both runners - so v8 is taken.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: winvhci-${{ matrix.platform }}-Debug
           path: pkg
@@ -235,7 +235,7 @@ jobs:
           Copy-Item C:\abuse-*.err diag\ -ErrorAction SilentlyContinue
           verifier /query > diag\verifier-query.txt
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: smoke-diag-${{ matrix.platform }}
@@ -325,7 +325,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: winvhci-${{ matrix.platform }}-Debug
           path: pkg
@@ -382,7 +382,7 @@ jobs:
           pnputil /enum-devices /problem > diag\problem-devices.txt
           Get-PnpDevice | Format-List * | Out-File diag\pnp-all.txt
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: consumer-diag-${{ matrix.platform }}
